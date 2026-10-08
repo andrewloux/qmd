@@ -4,6 +4,12 @@
 
 ### Added
 
+- SDK candidate search accepts configurable passage budgets and opt-in source
+  locations. Results distinguish exact/approximate lexical anchors, stored
+  vector starts, and keyword/intent selection windows; every location carries
+  its physical document URI and full content hash. The source-aware path
+  fits the returned source passage to the selected reranker's token budget,
+  scores that exact passage, and reports unavailable body anchors.
 - SDK `searchCandidates()` groups eligible documents by a scalar metadata
   key before per-leg admission and reciprocal rank fusion. Callers control
   raw retrieval depth and group targets, receive contribution traces and

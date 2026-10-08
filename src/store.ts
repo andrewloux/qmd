@@ -47,6 +47,7 @@ import {
   type VectorMigrationProgress,
 } from "./store-migrations.js";
 import type { Database, SQLiteValue } from "./db.js";
+import { normalizeCjkForFTS, parseLexicalQuery } from "./lexical-query.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
@@ -63,6 +64,7 @@ import {
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
   type RerankDocument,
+  type RerankTokenBudget,
   type ILLMSession,
 } from "./llm.js";
 import type {
@@ -82,6 +84,8 @@ import {
   parseMetadataJson,
   type MetadataKeyOverview,
 } from "./metadata-store.js";
+
+export { normalizeCjkForFTS, sanitizeFTS5Term } from "./lexical-query.js";
 
 // =============================================================================
 // Configuration
@@ -919,35 +923,7 @@ export function verifySqliteVecLoaded(db: Database): void {
 
 let _sqliteVecAvailable: boolean | null = null;
 
-const CJK_CHAR_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-const CJK_RUN_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 const FTS_CJK_NORMALIZED_VERSION = "1";
-
-/**
- * FTS5's unicode61 tokenizer does not segment CJK text into searchable words.
- * Normalize CJK runs by spacing every character so exact CJK queries can be
- * translated into phrase queries while Latin text keeps the default tokenizer.
- */
-export function normalizeCjkForFTS(text: string): string {
-  return text.replace(CJK_RUN_PATTERN, run => ` ${Array.from(run).join(' ')} `);
-}
-
-function containsCjk(text: string): boolean {
-  return CJK_CHAR_PATTERN.test(text);
-}
-
-function sanitizeFTS5Phrase(phrase: string): string {
-  // A quoted phrase is matched against tokens the porter unicode61 tokenizer
-  // produced, and that tokenizer splits document text on every separator.
-  // Deleting the separators here instead would collapse "1.0.21" to "1021" and
-  // "PIO-1384" to "pio1384", tokens no document holds, so the query returns
-  // nothing with no error (#757 for dots, #916 for the rest). Split on the same
-  // separators the tokenizer does and emit the parts as adjacent phrase terms.
-  return normalizeCjkForFTS(phrase)
-    .split(/\s+/)
-    .flatMap(t => splitFTS5CompoundTerm(t))
-    .join(' ');
-}
 
 // FTS sync triggers keep documents_fts current for callers that write directly
 // to documents (production indexing rebuilds FTS in TypeScript to normalize CJK
@@ -1629,6 +1605,7 @@ export type Store = {
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
+  getRerankTokenBudget: (query: string, intent?: string) => Promise<RerankTokenBudget>;
   /** Drop the cached expansion for a query so the next call regenerates. */
   invalidateExpansionCache: (query: string) => void;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
@@ -2662,6 +2639,7 @@ export function createStore(dbPath?: string): Store {
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
+    getRerankTokenBudget: (query, intent) => getLlm(store).getRerankTokenBudget(formatRerankQuery(query, intent)),
     invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
       // Cache keys must use the resolved rerank model (store.llm or the global
@@ -4524,37 +4502,6 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // FTS Search
 // =============================================================================
 
-export function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}'_]/gu, '').toLowerCase();
-}
-
-/**
- * A run of characters the FTS tokenizer treats as a separator.
- *
- * `documents_fts` is tokenized with `porter unicode61`, which starts a new
- * token at every character that is not a letter or a digit. Underscore is one
- * of those, but it is deliberately kept here rather than split on: FTS5 applies
- * the same tokenizer to a quoted phrase, so leaving `apply_secrets` intact lets
- * it split symmetrically into `apply secrets` on both sides, and that is the
- * behaviour #305 shipped. The apostrophe is kept for the same reason.
- */
-const FTS5_SEPARATOR_RUN = /[^\p{L}\p{N}'_]+/u;
-
-/**
- * Split one query term the way the tokenizer split the document text, and
- * sanitize each part.
- *
- * `PIO-1384` becomes ["pio", "1384"], `src/lib/i18n.ts` becomes
- * ["src", "lib", "i18n", "ts"], and a term with no separator in it comes back
- * as a single part. Callers join the parts into an FTS5 phrase, which is what
- * makes the parts have to be adjacent in the document rather than merely all
- * present. Parts that sanitize to nothing are dropped, so a term that is all
- * punctuation yields an empty list and the caller skips it.
- */
-function splitFTS5CompoundTerm(term: string): string[] {
-  return term.split(FTS5_SEPARATOR_RUN).map(p => sanitizeFTS5Term(p)).filter(p => p);
-}
-
 /**
  * Parse lex query syntax into FTS5 query.
  *
@@ -4583,89 +4530,13 @@ function splitFTS5CompoundTerm(term: string): string[] {
  *   src/lib/i18n.ts         → "src lib i18n ts"
  */
 function buildFTS5Query(query: string): string | null {
-  const positive: string[] = [];
-  const negative: string[] = [];
-
-  let i = 0;
-  const s = query.trim();
-
-  while (i < s.length) {
-    // Skip whitespace
-    while (i < s.length && /\s/.test(s[i]!)) i++;
-    if (i >= s.length) break;
-
-    // Check for negation prefix
-    const negated = s[i] === '-';
-    if (negated) i++;
-
-    // Check for quoted phrase
-    if (s[i] === '"') {
-      const start = i + 1;
-      i++;
-      while (i < s.length && s[i] !== '"') i++;
-      const phrase = s.slice(start, i).trim();
-      i++; // skip closing quote
-      if (phrase.length > 0) {
-        const sanitized = sanitizeFTS5Phrase(phrase);
-        if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // Exact phrase, no prefix match
-          if (negated) {
-            negative.push(ftsPhrase);
-          } else {
-            positive.push(ftsPhrase);
-          }
-        }
-      }
-    } else {
-      // Plain term (until whitespace or quote)
-      const start = i;
-      while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
-      const term = s.slice(start, i);
-
-      if (containsCjk(term)) {
-        const sanitized = sanitizeFTS5Phrase(term);
-        if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // CJK phrase over character tokens
-          if (negated) {
-            negative.push(ftsPhrase);
-          } else {
-            positive.push(ftsPhrase);
-          }
-        }
-      } else {
-        // Any separator inside the term (multi-agent, DEC-0054, 2026.4.10,
-        // src/lib/i18n.ts, @tobilu/qmd) split it at index time too, so the term
-        // has to be matched as the phrase those parts form. A term with no
-        // separator is one part and keeps its prefix match, which is what makes
-        // a plain word still match longer words that start with it.
-        const parts = splitFTS5CompoundTerm(term);
-        if (parts.length > 0) {
-          const ftsTerm = parts.length > 1
-            ? `"${parts.join(' ')}"`   // Phrase match (no prefix)
-            : `"${parts[0]}"*`;        // Prefix match
-          if (negated) {
-            negative.push(ftsTerm);
-          } else {
-            positive.push(ftsTerm);
-          }
-        }
-      }
-    }
-  }
-
-  if (positive.length === 0 && negative.length === 0) return null;
-
-  // If only negative terms, we can't search (FTS5 NOT is binary)
+  const clauses = parseLexicalQuery(query);
+  const positive = clauses.filter(clause => !clause.negated).map(clause => clause.ftsExpression);
+  const negative = clauses.filter(clause => clause.negated).map(clause => clause.ftsExpression);
   if (positive.length === 0) return null;
 
-  // Join positive terms with AND
-  let result = positive.join(' AND ');
-
-  // Add NOT clause for negative terms
-  for (const neg of negative) {
-    result = `${result} NOT ${neg}`;
-  }
-
+  let result = positive.join(" AND ");
+  for (const expression of negative) result += ` NOT ${expression}`;
   return result;
 }
 

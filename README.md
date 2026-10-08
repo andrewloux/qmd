@@ -335,7 +335,8 @@ const results4 = await store.search({ queries: expanded })
 ```
 
 `searchCandidates()` admits distinct metadata groups before rank fusion and
-returns contribution traces and coverage. See [grouped candidate retrieval](docs/CANDIDATE-SEARCH.md).
+returns contribution traces and coverage. See [grouped candidate retrieval](docs/CANDIDATE-SEARCH.md)
+and [source locations and configurable passages](docs/SEARCH-LOCATIONS.md).
 
 #### Retrieval
 

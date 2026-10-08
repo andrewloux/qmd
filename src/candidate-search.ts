@@ -17,9 +17,22 @@ import {
   type Store,
   type VectorScanCoverage,
 } from "./store.js";
-import { getDefaultLlamaCpp } from "./llm.js";
+import { getDefaultLlamaCpp, type RerankTokenBudget } from "./llm.js";
 import { parseMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import type { DocumentMetadata, MetadataScalar } from "./metadata.js";
+import {
+  boundedPassageWindow,
+  findLexicalLocation,
+  fitPassageWindow,
+  isUtf16Boundary,
+  selectionWindowLocation,
+  validatePassageBudget,
+  vectorChunkLocation,
+  type PassageBudget,
+  type PassageWindow,
+  type SearchLocation,
+  type Utf16Span,
+} from "./search-locations.js";
 
 type CandidateQueryInput =
   | {
@@ -55,6 +68,10 @@ export type CandidateSearchOptions = CandidateQueryInput & {
   rerank?: boolean;
   intent?: string;
   chunkStrategy?: ChunkStrategy;
+  /** Include source-location provenance and a bounded passage. */
+  locations?: boolean;
+  /** Include a bounded source passage using this caller budget. */
+  passage?: PassageBudget;
 };
 
 export type CandidateGroup = {
@@ -96,6 +113,10 @@ export type CandidateHit = {
   rrfRank: number;
   rrfTopRankBonus: number;
   matches: CandidateMatch[];
+  representativeLeg?: number;
+  passage?: PassageWindow;
+  locations?: SearchLocation[];
+  bodyAnchorStatus?: "located" | "unavailable";
 };
 
 export type CandidateLegCoverage = {
@@ -162,9 +183,14 @@ type GroupedRetrieval = {
 type CandidateDraft = Omit<CandidateHit, "context">;
 
 type HydrationOptions = {
+  primaryQuery: string;
   queryTerms: readonly string[];
   intentTerms: readonly string[];
+  intent?: string;
   shouldRerank: boolean;
+  wantsEvidence: boolean;
+  includeLocations: boolean;
+  passageBudget: PassageBudget;
   chunkStrategy?: ChunkStrategy;
 };
 
@@ -223,6 +249,12 @@ function validateOptions(options: CandidateSearchOptions): void {
     operator: "exists",
     value: true,
   });
+  if (options.locations !== undefined && typeof options.locations !== "boolean") {
+    throw new Error("locations must be a boolean");
+  }
+  if (options.locations === true || options.passage !== undefined) {
+    validatePassageBudget(options.passage ?? { maxUtf8Bytes: 48_000 });
+  }
   positiveInteger(options.limit ?? 10, "limit");
   positiveInteger(options.candidateLimit ?? RERANK_CANDIDATE_LIMIT, "candidateLimit");
   const minScore = options.minScore ?? 0;
@@ -382,6 +414,17 @@ async function retrieveGroupedCandidates(
   };
 }
 
+function passageForAnchor(
+  body: string,
+  anchor: Utf16Span,
+  passageBudget: PassageBudget,
+  rerankTokenBudget: RerankTokenBudget | undefined,
+): PassageWindow {
+  return rerankTokenBudget === undefined
+    ? boundedPassageWindow(body, anchor, passageBudget)
+    : fitPassageWindow(body, anchor, passageBudget, rerankTokenBudget);
+}
+
 async function hydrateCandidates(
   store: Store,
   admittedGroups: readonly GroupRankingEntry[],
@@ -397,6 +440,7 @@ async function hydrateCandidates(
     SELECT c.doc AS body FROM content c JOIN documents d ON d.hash = c.hash
     WHERE d.active = 1 AND c.hash = ? AND 'qmd://' || d.collection || '/' || d.path = ? LIMIT 1
   `);
+  let rerankTokenBudget: RerankTokenBudget | undefined;
 
   for (const [admittedIndex, fusedGroup] of admittedGroups.entries()) {
     const groupEvidence = evidence.get(fusedGroup.file);
@@ -408,7 +452,66 @@ async function hydrateCandidates(
     if (!content) continue;
 
     const body = content.body;
-    if (options.shouldRerank) {
+    if (options.shouldRerank && options.wantsEvidence && rerankTokenBudget === undefined) {
+      rerankTokenBudget = await store.getRerankTokenBudget(options.primaryQuery, options.intent);
+    }
+
+    const reference = {
+      uri: representative.filepath,
+      contentHash: representative.hash,
+    };
+    const locations: SearchLocation[] | undefined = options.includeLocations ? [] : undefined;
+    if (locations !== undefined) {
+      for (const match of groupEvidence.matches) {
+        if (match.vectorStartUtf16 !== undefined) {
+          locations.push(vectorChunkLocation(
+            {
+              uri: match.file,
+              contentHash: match.contentHash,
+            },
+            match.vectorStartUtf16,
+            match.vectorChunkSeq ?? null,
+          ));
+        }
+      }
+    }
+
+    let passage: PassageWindow | undefined;
+    let bodyAnchorStatus: "located" | "unavailable" = "unavailable";
+    if (options.wantsEvidence) {
+      const representativeMatch = groupEvidence.representativeMatch;
+      let anchor: Utf16Span | undefined;
+      if (representative.source === "vec") {
+        const startUtf16 = representativeMatch.vectorStartUtf16;
+        if (startUtf16 !== undefined && startUtf16 <= body.length && isUtf16Boundary(body, startUtf16)) {
+          anchor = {
+            startUtf16,
+            endUtf16: startUtf16,
+          };
+        }
+      } else {
+        const lexicalLocation = findLexicalLocation(
+          body,
+          representativeMatch.query,
+          reference,
+        );
+        if (lexicalLocation !== null) {
+          anchor = {
+            startUtf16: lexicalLocation.startUtf16,
+            endUtf16: lexicalLocation.endUtf16,
+          };
+          locations?.push(lexicalLocation);
+        }
+      }
+
+      if (anchor !== undefined) {
+        passage = passageForAnchor(body, anchor, options.passageBudget, rerankTokenBudget);
+        bodyAnchorStatus = "located";
+      }
+    }
+
+    let rerankText = passage?.text;
+    if (rerankText === undefined && (options.shouldRerank || options.wantsEvidence)) {
       const chunks = await chunkDocumentAsync(
         body,
         undefined,
@@ -418,9 +521,27 @@ async function hydrateCandidates(
         options.chunkStrategy,
       );
       const bestChunk = chunks[selectBestChunkIndex(chunks, options.queryTerms, options.intentTerms)];
+      rerankText = bestChunk?.text ?? body;
+      if (options.wantsEvidence) {
+        const selectionSpan = {
+          startUtf16: bestChunk?.pos ?? 0,
+          endUtf16: (bestChunk?.pos ?? 0) + rerankText.length,
+        };
+        locations?.push(selectionWindowLocation(reference, selectionSpan));
+        passage = passageForAnchor(
+          body,
+          selectionSpan,
+          options.passageBudget,
+          rerankTokenBudget,
+        );
+        rerankText = passage.text;
+      }
+    }
+
+    if (options.shouldRerank) {
       rerankInputs.push({
         file: fusedGroup.file,
-        text: bestChunk?.text ?? body,
+        text: rerankText ?? body,
       });
     }
 
@@ -438,6 +559,14 @@ async function hydrateCandidates(
       rrfRank,
       rrfTopRankBonus: rrfTopRankBonus(topGroupRank),
       matches: groupEvidence.matches,
+      ...(options.wantsEvidence
+        ? {
+          passage,
+          bodyAnchorStatus,
+          representativeLeg: groupEvidence.representativeMatch.leg,
+        }
+        : {}),
+      ...(locations === undefined ? {} : { locations }),
     });
   }
 
@@ -490,19 +619,26 @@ export async function searchCandidates(store: Store, options: CandidateSearchOpt
     ? options.query
     : primaryQueryFor(options.queries);
   const shouldRerank = options.rerank !== false;
-  const queryTerms = shouldRerank
+  const wantsEvidence = options.locations === true || options.passage !== undefined;
+  const selectsContent = shouldRerank || wantsEvidence;
+  const queryTerms = selectsContent
     ? primaryQuery.toLowerCase().split(/\s+/).filter(term => term.length > 2)
     : [];
-  const intentTerms = shouldRerank && options.intent ? extractIntentTerms(options.intent) : [];
+  const intentTerms = selectsContent && options.intent ? extractIntentTerms(options.intent) : [];
   const hydrated = await hydrateCandidates(
     store,
     admittedGroups,
     retrieval.evidence,
     {
+      primaryQuery,
       queryTerms,
       intentTerms,
+      intent: options.intent,
       shouldRerank,
-      chunkStrategy: shouldRerank ? options.chunkStrategy : undefined,
+      wantsEvidence,
+      includeLocations: options.locations === true,
+      passageBudget: options.passage ?? { maxUtf8Bytes: 48_000 },
+      chunkStrategy: selectsContent ? options.chunkStrategy : undefined,
     },
   );
   const scoredCandidates = shouldRerank

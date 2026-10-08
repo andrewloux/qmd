@@ -128,6 +128,14 @@ export type {
   CandidateLegCoverage,
 } from "./candidate-search.js";
 export type {
+  SearchLocation,
+  LexicalLocation,
+  DocumentLocationRef,
+  Utf16Span,
+  PassageBudget,
+  PassageWindow,
+} from "./search-locations.js";
+export type {
   DocumentResult,
   DocumentNotFound,
   DocumentExcludedByIgnore,
