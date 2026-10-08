@@ -15,6 +15,15 @@ import {
 import { getDefaultLlamaCpp } from "./llm.js";
 import { parseMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import type { DocumentMetadata, MetadataScalar } from "./metadata.js";
+import {
+  boundedPassageWindow,
+  locateLexical,
+  selectionWindowLocation,
+  vectorChunkLocation,
+  type PassageBudget,
+  type PassageWindow,
+  type SearchLocation,
+} from "./search-locations.js";
 
 export type CandidateSearchOptions = {
   query?: string;
@@ -32,6 +41,8 @@ export type CandidateSearchOptions = {
   rerank?: boolean;
   intent?: string;
   chunkStrategy?: ChunkStrategy;
+  locations?: boolean;
+  passage?: PassageBudget;
 };
 
 export type CandidateGroup = {
@@ -53,6 +64,7 @@ export type CandidateMatch = {
   weight: number;
   rrfContribution: number;
   vectorStartUtf16?: number;
+  vectorChunkSeq?: number;
 };
 
 export type CandidateHit = {
@@ -68,6 +80,10 @@ export type CandidateHit = {
   rrfRank: number;
   rrfTopRankBonus: number;
   matches: CandidateMatch[];
+  representativeLeg?: number;
+  passage?: PassageWindow;
+  locations?: SearchLocation[];
+  bodyAnchorStatus?: "located" | "unavailable";
 };
 
 export type CandidateLegCoverage = {
@@ -95,7 +111,7 @@ export type CandidateSearchResult = {
 };
 
 type RetrievalLeg = ExpandedQuery & { queryType: CandidateMatch["queryType"]; weight: number };
-type GroupEvidence = { group: CandidateGroup; representative: SearchResult; representativeContribution: number; matches: CandidateMatch[] };
+type GroupEvidence = { group: CandidateGroup; representative: SearchResult; representativeMatch: CandidateMatch; matches: CandidateMatch[] };
 
 function positiveInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive safe integer`);
@@ -150,6 +166,10 @@ export async function searchCandidates(store: Store, options: CandidateSearchOpt
   const metadataKey = options.candidates.group.metadataKey;
   parseMetadataFilter({ field: metadataKey, operator: "exists", value: true });
   const filter = options.filter === undefined ? undefined : parseMetadataFilter(options.filter);
+  if (options.locations !== undefined && typeof options.locations !== "boolean") throw new Error("locations must be a boolean");
+  const wantsEvidence = options.locations === true || options.passage !== undefined;
+  const passageBudget = options.passage ?? { maxUtf8Bytes: 48_000 };
+  if (wantsEvidence) boundedPassageWindow("", { startUtf16: 0, endUtf16: 0 }, passageBudget);
   const limit = options.limit ?? 10;
   const candidateLimit = options.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   positiveInteger(limit, "limit");
@@ -185,17 +205,18 @@ export async function searchCandidates(store: Store, options: CandidateSearchOpt
         file: hit.filepath, contentHash: hit.hash, rawRank: rawIndex + 1, groupRank,
         backendScore: hit.score, weight: leg.weight, rrfContribution: leg.weight / (60 + groupRank),
         ...(hit.chunkPos === undefined ? {} : { vectorStartUtf16: hit.chunkPos }),
+        ...(hit.chunkSeq === undefined ? {} : { vectorChunkSeq: hit.chunkSeq }),
       };
       const existing = evidence.get(group.key);
       if (existing) {
         existing.matches.push(match);
         // The largest RRF contribution wins; input leg order breaks ties.
-        if (match.rrfContribution > existing.representativeContribution) {
+        if (match.rrfContribution > existing.representativeMatch.rrfContribution) {
           existing.representative = hit;
-          existing.representativeContribution = match.rrfContribution;
+          existing.representativeMatch = match;
         }
       } else {
-        evidence.set(group.key, { group, representative: hit, representativeContribution: match.rrfContribution, matches: [match] });
+        evidence.set(group.key, { group, representative: hit, representativeMatch: match, matches: [match] });
       }
       ranked.push({ file: group.key, displayPath: hit.displayPath, title: hit.title, body: "", score: hit.score });
     }
@@ -225,16 +246,58 @@ export async function searchCandidates(store: Store, options: CandidateSearchOpt
     const content = bodyOf.get<{ body: string }>(representative.hash, representative.filepath);
     if (!content) continue;
     const body = content.body;
-    const chunks = await chunkDocumentAsync(body, undefined, undefined, undefined, representative.filepath, options.chunkStrategy);
-    let best = chunks[0];
-    let bestScore = -1;
-    for (const chunk of chunks) {
-      const text = chunk.text.toLowerCase();
-      const score = queryTerms.reduce((sum, term) => sum + Number(text.includes(term)), 0)
-        + intentTerms.reduce((sum, term) => sum + 0.5 * Number(text.includes(term)), 0);
-      if (score > bestScore) { best = chunk; bestScore = score; }
+    const ref = { uri: representative.filepath, contentHash: representative.hash };
+    const locations: SearchLocation[] = [];
+    let passage: PassageWindow | undefined;
+    let bodyAnchorStatus: "located" | "unavailable" = "unavailable";
+    if (wantsEvidence) {
+      for (const match of groupEvidence.matches) {
+        if (match.vectorStartUtf16 !== undefined) {
+          locations.push(vectorChunkLocation({ uri: match.file, contentHash: match.contentHash },
+            match.vectorStartUtf16, match.vectorChunkSeq ?? null));
+        }
+      }
+      const representativeMatch = groupEvidence.representativeMatch;
+      if (representative.source === "vec") {
+        const start = representativeMatch.vectorStartUtf16;
+        if (start !== undefined && start <= body.length) {
+          const atScalarBoundary = start === 0 || start === body.length
+            || !(body.charCodeAt(start - 1) >= 0xd800 && body.charCodeAt(start - 1) <= 0xdbff
+              && body.charCodeAt(start) >= 0xdc00 && body.charCodeAt(start) <= 0xdfff);
+          if (atScalarBoundary) {
+            passage = boundedPassageWindow(body, { startUtf16: start, endUtf16: start }, passageBudget);
+            bodyAnchorStatus = "located";
+          }
+        }
+      } else {
+        const located = locateLexical(body, representativeMatch.query, ref, passageBudget);
+        if (located) {
+          locations.push(located.location);
+          passage = located.passage;
+          bodyAnchorStatus = "located";
+        }
+      }
     }
-    rerankInputs.push({ file: fusedHit.file, text: best?.text ?? body });
+    let rerankText = passage?.text;
+    if (rerankText === undefined) {
+      const chunks = await chunkDocumentAsync(body, undefined, undefined, undefined, representative.filepath, options.chunkStrategy);
+      let best = chunks[0];
+      let bestScore = -1;
+      for (const chunk of chunks) {
+        const text = chunk.text.toLowerCase();
+        const score = queryTerms.reduce((sum, term) => sum + Number(text.includes(term)), 0)
+          + intentTerms.reduce((sum, term) => sum + 0.5 * Number(text.includes(term)), 0);
+        if (score > bestScore) { best = chunk; bestScore = score; }
+      }
+      rerankText = best?.text ?? body;
+      if (wantsEvidence) {
+        const span = { startUtf16: best?.pos ?? 0, endUtf16: (best?.pos ?? 0) + rerankText.length };
+        locations.push(selectionWindowLocation(ref, span));
+        passage = boundedPassageWindow(body, span, passageBudget);
+        rerankText = passage.text;
+      }
+    }
+    rerankInputs.push({ file: fusedHit.file, text: rerankText });
     candidates.push({
       group: groupEvidence.group, file: representative.filepath, contentHash: representative.hash,
       displayPath: representative.displayPath, title: representative.title, metadata: representative.metadata,
@@ -242,6 +305,8 @@ export async function searchCandidates(store: Store, options: CandidateSearchOpt
       rrfTopRankBonus: groupEvidence.matches.some(match => match.groupRank === 1) ? 0.05
         : groupEvidence.matches.some(match => match.groupRank <= 3) ? 0.02 : 0,
       matches: groupEvidence.matches,
+      ...(wantsEvidence ? { passage, bodyAnchorStatus, representativeLeg: groupEvidence.representativeMatch.leg } : {}),
+      ...(options.locations ? { locations } : {}),
     });
   }
   if (options.rerank !== false && rerankInputs.length) {

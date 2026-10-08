@@ -70,7 +70,6 @@ import {
   LlamaCpp,
 } from "./llm.js";
 import { searchCandidates, type CandidateSearchOptions, type CandidateSearchResult } from "./candidate-search.js";
-export type { CandidateSearchOptions, CandidateSearchResult, CandidateHit, CandidateGroup, CandidateMatch, CandidateLegCoverage } from "./candidate-search.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -120,6 +119,22 @@ import {
 } from "./collections.js";
 
 // Re-export types for SDK consumers
+export type {
+  CandidateSearchOptions,
+  CandidateSearchResult,
+  CandidateHit,
+  CandidateGroup,
+  CandidateMatch,
+  CandidateLegCoverage,
+} from "./candidate-search.js";
+export type {
+  SearchLocation,
+  LexicalLocation,
+  DocumentLocationRef,
+  Utf16Span,
+  PassageBudget,
+  PassageWindow,
+} from "./search-locations.js";
 export type {
   DocumentResult,
   DocumentNotFound,

@@ -2806,6 +2806,7 @@ export type SearchResult = DocumentResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
+  chunkSeq?: number;          // Stored chunk sequence, returned by compact vector retrieval
 };
 
 /**
@@ -4836,6 +4837,7 @@ interface VecDocumentMatch {
   rowid: number;
   hash: string;
   pos: number;
+  seq: number;
   filepath: string;
   display_path: string;
   title: string;
@@ -4941,6 +4943,7 @@ function vecDocumentResolver(db: Database, filter?: MetadataFilter): (matches: r
       vr.id AS rowid,
       cv.hash,
       cv.pos,
+      cv.seq,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
@@ -5064,6 +5067,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
+        ...(retrieval?.includeBody === false ? { chunkSeq: row.seq } : {}),
       }];
     });
 }
