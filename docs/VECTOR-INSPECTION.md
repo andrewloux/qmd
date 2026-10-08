@@ -33,6 +33,8 @@ The result reports:
 
 - `model` and `embeddingFingerprint`: the selected recorded generation.
 - `partitionState`: `absent`, `legacy`, `unreadable`, or `checked`.
+  `checked` means the readable partition's peer scan completed; the counters
+  determine readiness.
 - `activeDocuments` and `needsEmbedding`: active paths and QMD's ordinary
   selected-model pending count.
 - `inconsistentChunkLayouts`: active hashes whose stored chunks disagree on
@@ -51,8 +53,8 @@ The result reports:
 The ordinary pending count and all deep reads share the transaction snapshot.
 Exact chunk-layout checks catch excess, gapped, mixed-generation, and null-total
 records that the ordinary pending counter can accept. Peer inspection streams
-the mapping table and vec0 separately, using indexed rowid probes. Each broken
-rowid counts once. The JavaScript peer scan uses constant heap space; SQLite
+`vector_rows` and the vec0 table `vectors_by_collection` separately, using
+indexed rowid probes. Each broken rowid counts once. The JavaScript peer scan uses constant heap space; SQLite
 performs the relational aggregation. Coherent inactive cache rows remain valid
 because QMD can copy those vectors when the content joins a collection.
 
@@ -68,6 +70,8 @@ The following table reads top-down; the first matching row determines readiness.
 | `checked` | `0` | `0` | `0` | `0` | any | true |
 | `absent` | `0` | `0` | `0` | `0` | `0` | true |
 | `absent` | `0` | `0` | `0` | `0` | `> 0` | false |
+
+## Caller-owned provenance checks
 
 QMD's fingerprint describes the model identifier, formatting, and chunking
 parameters. The ingesting application records the model-file SHA256 and

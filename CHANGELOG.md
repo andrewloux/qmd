@@ -7,13 +7,14 @@
 - SDK `inspectVectorIndex()` checks selected model/fingerprint chunk layouts,
   required active collection partitions, and both directions of physical
   map/vector integrity in one SQLite snapshot. It reports structural readiness
-  and explicit corruption counts, preserves coherent inactive vector caches,
+  and explicit corruption counts, accepts coherent inactive vector caches,
   and leaves the existing cheap health call and repair paths intact.
 - SDK candidate search accepts configurable passage budgets and opt-in source
   locations. Results distinguish exact/approximate lexical anchors, stored
   vector starts, and keyword/intent selection windows; every location carries
   its physical document URI and full content hash. The source-aware path
-  reranks the returned bounded passage and reports unavailable body anchors.
+  fits the returned source passage to the selected reranker's token budget,
+  scores that exact passage, and reports unavailable body anchors.
 - SDK `searchCandidates()` groups eligible documents by a scalar metadata
   key before per-leg admission and reciprocal rank fusion. Callers control
   raw retrieval depth and group targets, receive contribution traces and

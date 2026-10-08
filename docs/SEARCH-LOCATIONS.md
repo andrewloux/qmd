@@ -60,8 +60,9 @@ Each vector contribution retains its own URI, content hash, start, and
 sequence. A sibling's vector anchor points into that sibling's source.
 The representative's lexical anchor comes from the representative contribution
 and body. Every passage belongs to the result's representative `file` and
-`contentHash`. Reranking scores the chosen passage; the passage's origin
-records the selection that produced its text.
+`contentHash`. The result's `representativeLeg` identifies the contribution
+that selected the representative. Its typed location records the anchor or
+selection span used to build the passage.
 
 ## Limits and clipping
 
@@ -71,6 +72,15 @@ around the requested anchor, alternating left and right within the available
 budget. A full anchor that exceeds the budget keeps its location and returns
 a clipped passage with `anchorClipped: true`. A zero-byte budget returns empty
 text and exact zero usage. Every returned window preserves scalar boundaries.
+
+With reranking enabled, QMD also measures the passage with the selected
+reranker's tokenizer. The available document tokens account for the context
+window, template overhead, and the same intent-prefixed query used for
+scoring. QMD shrinks the source window around its anchor until a measured
+passage fits both budgets. The result reports the fitted source range and
+usage. Token fitting preserves the full anchor when it fits both budgets. A
+clipped anchor remains labelled `anchorClipped: true`. This path loads the
+reranker tokenizer even when scoring can reuse cached scores.
 
 The service adapter owns configurable ceilings and serialized-envelope limits.
 These SDK budgets apply to each passage. The SDK hydrates each admitted source
@@ -88,8 +98,8 @@ and measures the full serialized envelope before returning a response.
 From the repository root:
 
 ```sh
-bun run test:node test/search-locations.test.ts test/candidate-locations.test.ts
-bun run test:bun test/search-locations.test.ts test/candidate-locations.test.ts
+bun run test:node test/search-locations.test.ts test/candidate-locations.test.ts test/rerank-passage.test.ts
+bun run test:bun test/search-locations.test.ts test/candidate-locations.test.ts test/rerank-passage.test.ts
 bun run test:types
 bun run lint
 ```
@@ -97,5 +107,7 @@ bun run lint
 Fixtures verify late lexical and vector starts, astral Unicode, complete-scalar
 boundaries, positive/negative query clauses, clipped anchors, unavailable body
 anchors, distinct sibling provenance, and equality between the returned
-passage and reranker input. A short-body regression verifies termination at
+passage and the text passed to the model's scoring context. Token-budget
+fixtures cover intent, clipped Unicode anchors, and nonmonotonic token counts.
+A short-body regression verifies termination at
 both document edges.

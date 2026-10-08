@@ -63,9 +63,10 @@ selection behavior; the runtime chunk-strategy default is `regex`.
 
 Applications own configurable service ceilings, deadlines, serialized
 response limits, and cumulative task budgets. Increasing raw depth increases
-backend work. Vector legs execute sequentially through QMD's existing cached
-embedding primitive. Hydration processes each admitted source body in turn;
-the transient body and chunk allocations follow the source document's size.
+backend work. Vector legs run one at a time through the store-selected
+embedding model. Each vector leg computes its query embedding. Hydration
+processes each admitted source body in turn; the transient body and chunk
+allocations follow the source document's size.
 Normal file ingestion accepts source files up to `10 MB`.
 
 ## Identity, evidence, and coverage
@@ -84,7 +85,8 @@ bonus. A vector contribution also carries the actual `vectorStartUtf16`.
 Scores report ranking signals; probability calibration belongs to the caller.
 
 `coverage.legs` reports raw depth, raw count, depth saturation, admitted group
-count, and group shortfall. Vector legs report their final per-target KNN scan:
+count, and group shortfall. Each leg also records its `queryType`. Vector
+legs report their final per-target KNN scan, including the collection name:
 requested chunk count, returned chunk count, resolved document count, and
 `backendCapReached`. That field becomes true when a scan fills SQLite's
 `4096`-chunk ceiling. Raw document-depth saturation and vector chunk saturation
@@ -94,7 +96,8 @@ list; readiness inspection supplies the structural index state.
 Top-level coverage counts fused, admitted, unavailable, and returned groups.
 An unavailable group had a representative path/hash whose active source
 disappeared before hydration. The returned counts also reflect score filtering
-and the final result limit. Applications can pin an immutable generation when
+and the final result limit. Context lookup runs for the final returned
+representatives. Applications can pin an immutable generation when
 search, metadata, and subsequent source reads need one shared generation.
 
 ## Validation
