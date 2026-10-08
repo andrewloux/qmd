@@ -11,6 +11,7 @@ import {
   hashContent,
   searchVec,
   type CollectionScope,
+  type ExpandedQuery,
   type SearchRetrievalOptions,
   type Store,
 } from "../src/store.js";
@@ -31,6 +32,12 @@ type RetrievalCall = {
   query: string;
   scope: CollectionScope;
   retrieval: SearchRetrievalOptions | undefined;
+};
+
+type RerankCall = {
+  query: string;
+  intent: string | undefined;
+  documents: { file: string; text: string }[];
 };
 
 let testDir: string;
@@ -258,7 +265,7 @@ function installFaithfulRetrievalWrappers(): void {
 
 function candidateOptions(
   collection: string,
-  queries: CandidateSearchOptions["queries"],
+  queries: readonly ExpandedQuery[],
   extra: Pick<CandidateSearchOptions, "locations" | "passage" | "rerank"> = {},
 ): CandidateSearchOptions {
   return {
@@ -273,6 +280,42 @@ function candidateOptions(
     rerank: extra.rerank ?? false,
     ...(extra.locations === undefined ? {} : { locations: extra.locations }),
     ...(extra.passage === undefined ? {} : { passage: extra.passage }),
+  };
+}
+
+function installDeterministicReranker(maxDocumentTokens = 256): {
+  budgetCalls: { query: string; intent: string | undefined }[];
+  rerankCalls: RerankCall[];
+  restore: () => void;
+} {
+  const budgetCalls: { query: string; intent: string | undefined }[] = [];
+  const rerankCalls: RerankCall[] = [];
+  const actualGetRerankTokenBudget = store.getRerankTokenBudget;
+  const actualRerank = store.rerank;
+
+  store.getRerankTokenBudget = async (query, intent) => {
+    budgetCalls.push({ query, intent });
+    return {
+      maxDocumentTokens,
+      countTokens: text => Array.from(text).length,
+    };
+  };
+  store.rerank = async (query, rerankDocuments, _model, intent) => {
+    rerankCalls.push({
+      query,
+      intent,
+      documents: rerankDocuments.map(document => ({ ...document })),
+    });
+    return rerankDocuments.map(document => ({ file: document.file, score: 0.75 }));
+  };
+
+  return {
+    budgetCalls,
+    rerankCalls,
+    restore: () => {
+      store.getRerankTokenBudget = actualGetRerankTokenBudget;
+      store.rerank = actualRerank;
+    },
   };
 }
 
@@ -497,15 +540,7 @@ describe("group provenance", () => {
 
 describe("passage budgets and reranking", () => {
   test("uses the returned bounded passage as the reranker input", async () => {
-    const calls: { query: string; documents: { file: string; text: string }[] }[] = [];
-    const actualRerank = store.rerank;
-    store.rerank = async (query, rerankDocuments) => {
-      calls.push({
-        query,
-        documents: rerankDocuments.map(document => ({ ...document })),
-      });
-      return rerankDocuments.map(document => ({ file: document.file, score: 0.75 }));
-    };
+    const reranker = installDeterministicReranker(12);
     try {
       const result = await sdk.searchCandidates(candidateOptions(
         "rerank",
@@ -520,15 +555,125 @@ describe("passage budgets and reranking", () => {
 
       expect(hit.passage?.text).toContain("exactmarker");
       expect(hit.passage?.utf8Bytes).toBeLessThanOrEqual(48);
-      expect(hit.passage?.unicodeScalars).toBeLessThanOrEqual(48);
-      expect(calls).toHaveLength(1);
-      expect(calls[0]!.query).toBe("exactmarker");
-      expect(calls[0]!.documents).toEqual([{
+      expect(hit.passage?.unicodeScalars).toBeLessThanOrEqual(12);
+      expect(reranker.budgetCalls).toEqual([{ query: "exactmarker", intent: undefined }]);
+      expect(reranker.rerankCalls).toHaveLength(1);
+      expect(reranker.rerankCalls[0]!.query).toBe("exactmarker");
+      expect(reranker.rerankCalls[0]!.documents).toEqual([{
         file: hit.group.key,
         text: hit.passage!.text,
       }]);
     } finally {
-      store.rerank = actualRerank;
+      reranker.restore();
+    }
+  });
+
+  test("returns a passage without exposing location metadata", async () => {
+    const source = documents.get("lateLex")!;
+    const result = await sdk.searchCandidates(candidateOptions(
+      "late-lex",
+      [{ type: "lex", query: '"Orbit command"' }],
+      { passage: { maxUtf8Bytes: 32 }, rerank: false },
+    ));
+    const hit = singleResult(result);
+
+    expect(hit.passage?.text).toContain("Orbit command");
+    expect(source.body.slice(hit.passage!.startUtf16, hit.passage!.endUtf16))
+      .toBe(hit.passage!.text);
+    expect(Object.hasOwn(hit, "locations")).toBe(false);
+  });
+
+  test("keeps vector, fallback, and intent passages as exact source slices", async () => {
+    const reranker = installDeterministicReranker(18);
+    try {
+      const vectorResult = await sdk.searchCandidates(candidateOptions(
+        "late-vec",
+        [{ type: "vec", query: "late-vector" }],
+        { passage: { maxUtf8Bytes: 100 }, rerank: true },
+      ));
+      const fallbackResult = await sdk.searchCandidates(candidateOptions(
+        "unavailable",
+        [{ type: "lex", query: "titlemarker" }],
+        { passage: { maxUtf8Bytes: 128 }, rerank: true },
+      ));
+      const intentResult = await sdk.searchCandidates({
+        ...candidateOptions(
+          "unavailable",
+          [{ type: "lex", query: "pathmarker" }],
+          { passage: { maxUtf8Bytes: 128 }, rerank: true },
+        ),
+        intent: "keyword intent fallback",
+      });
+
+      const passageCases = [
+        [vectorResult, documents.get("lateVec")!],
+        [fallbackResult, documents.get("titleOnly")!],
+        [intentResult, documents.get("pathOnly")!],
+      ] as const;
+      for (const [index, [result, source]] of passageCases.entries()) {
+        const hit = singleResult(result);
+        expect(source.body.slice(hit.passage!.startUtf16, hit.passage!.endUtf16))
+          .toBe(hit.passage!.text);
+        expect(Array.from(hit.passage!.text).length).toBeLessThanOrEqual(18);
+        expect(reranker.rerankCalls[index]!.documents[0]!.text).toBe(hit.passage!.text);
+      }
+
+      expect(reranker.budgetCalls).toEqual([
+        { query: "late-vector", intent: undefined },
+        { query: "titlemarker", intent: undefined },
+        { query: "pathmarker", intent: "keyword intent fallback" },
+      ]);
+      expect(reranker.rerankCalls.map(call => ({ query: call.query, intent: call.intent })))
+        .toEqual(reranker.budgetCalls);
+    } finally {
+      reranker.restore();
+    }
+  });
+
+  test("reuses one token budget across hydrated candidate groups", async () => {
+    const reranker = installDeterministicReranker(18);
+    try {
+      const result = await sdk.searchCandidates(candidateOptions(
+        "unavailable",
+        [{ type: "lex", query: "body" }],
+        { passage: { maxUtf8Bytes: 128 }, rerank: true },
+      ));
+
+      expect(result.results).toHaveLength(2);
+      expect(reranker.budgetCalls).toEqual([{ query: "body", intent: undefined }]);
+      expect(reranker.rerankCalls).toHaveLength(1);
+      expect(reranker.rerankCalls[0]!.documents).toHaveLength(2);
+    } finally {
+      reranker.restore();
+    }
+  });
+
+  test("defers the token budget until candidate body hydration succeeds", async () => {
+    const actualSearchFts = store.searchFTS;
+    const compactHit = actualSearchFts(
+      "paritymarker",
+      5,
+      "parity",
+      undefined,
+      { includeBody: false, includeContext: false },
+    )[0]!;
+    const unhydratedHit = { ...compactHit, hash: "missing-content-hash" };
+    store.searchFTS = () => [unhydratedHit];
+    const reranker = installDeterministicReranker(18);
+
+    try {
+      const result = await sdk.searchCandidates(candidateOptions(
+        "parity",
+        [{ type: "lex", query: "paritymarker" }],
+        { passage: { maxUtf8Bytes: 128 }, rerank: true },
+      ));
+
+      expect(result.results).toEqual([]);
+      expect(reranker.budgetCalls).toEqual([]);
+      expect(reranker.rerankCalls).toEqual([]);
+    } finally {
+      reranker.restore();
+      store.searchFTS = actualSearchFts;
     }
   });
 

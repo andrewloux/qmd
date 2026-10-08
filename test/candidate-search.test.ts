@@ -12,6 +12,7 @@ import {
   hashContent,
   searchVec,
   type CollectionScope,
+  type ExpandedQuery,
   type SearchRetrievalOptions,
   type Store,
 } from "../src/store.js";
@@ -40,6 +41,7 @@ let sdk: QMDStore;
 let store: Store;
 let realDb: Database;
 let hydrationReads = 0;
+let contextReads = 0;
 const retrievalCalls: RetrievalCall[] = [];
 
 beforeAll(async () => {
@@ -234,6 +236,11 @@ async function seedVectorCapDocuments(): Promise<void> {
 
 function installFaithfulSearchWrappers(): void {
   const actualSearchFts = store.searchFTS;
+  const actualGetContextForFile = store.getContextForFile;
+  store.getContextForFile = filepath => {
+    contextReads++;
+    return actualGetContextForFile(filepath);
+  };
   store.searchFTS = (query, limit, scope, filter, retrieval) => {
     const results = actualSearchFts(query, limit, scope, filter, retrieval);
     retrievalCalls.push({
@@ -306,7 +313,7 @@ function observingHydrationDb(db: Database): Database {
 }
 
 function candidates(
-  queries: CandidateSearchOptions["queries"],
+  queries: readonly ExpandedQuery[],
   rawLimitPerLeg = 28,
   targetGroupsPerLeg = 10,
 ): CandidateSearchOptions {
@@ -326,6 +333,7 @@ function candidates(
 function resetObservations(): void {
   retrievalCalls.length = 0;
   hydrationReads = 0;
+  contextReads = 0;
 }
 
 describe("compact backend retrieval", () => {
@@ -386,6 +394,7 @@ describe("per-leg group admission", () => {
         legs: [{
           leg: 0,
           query: source === "lex" ? "signal" : "semantic",
+          queryType: source,
           source: source === "lex" ? "fts" : "vec",
           rawLimit: 28,
           rawReturned: 28,
@@ -526,6 +535,66 @@ describe("scope and fusion", () => {
     expect(target.matches.map(match => match.weight)).toEqual([2, 1, 1]);
     expect(target.file).toBe("qmd://representative/target-first.md");
   });
+
+  test("uses a vector query as the rerank query when a hyde query appears first", async () => {
+    const actualRerank = store.rerank;
+    let receivedQuery: string | undefined;
+    store.rerank = async (query, documents) => {
+      receivedQuery = query;
+      return documents.map(document => ({
+        file: document.file,
+        score: 1,
+      }));
+    };
+
+    try {
+      await sdk.searchCandidates({
+        queries: [
+          { type: "hyde", query: "hypothetical answer" },
+          { type: "vec", query: "semantic question" },
+        ],
+        collection: "compact",
+        candidates: {
+          rawLimitPerLeg: 1,
+          group: {
+            metadataKey: GROUP_KEY,
+            targetGroupsPerLeg: 1,
+          },
+        },
+        candidateLimit: 1,
+        limit: 1,
+      });
+    } finally {
+      store.rerank = actualRerank;
+    }
+
+    expect(receivedQuery).toBe("semantic question");
+  });
+
+  test("blends rerank scores with the original RRF positions", async () => {
+    const actualRerank = store.rerank;
+    store.rerank = async (_query, documents) => documents.map(document => ({
+      file: document.file,
+      score: 0.8,
+    }));
+
+    let result;
+    try {
+      result = await sdk.searchCandidates({
+        ...candidates([{ type: "lex", query: "signal" }]),
+        candidateLimit: 10,
+        limit: 10,
+        rerank: true,
+      });
+    } finally {
+      store.rerank = actualRerank;
+    }
+
+    const first = result.results.find(hit => hit.rrfRank === 1)!;
+    const fourth = result.results.find(hit => hit.rrfRank === 4)!;
+    expect(first.score).toBeCloseTo(0.95, 12);
+    expect(fourth.score).toBeCloseTo(0.47, 12);
+  });
 });
 
 describe("leg weights and backend coverage", () => {
@@ -574,6 +643,46 @@ describe("leg weights and backend coverage", () => {
     }
   });
 
+  test("accepts lexical negation in a plain query", async () => {
+    const actualExpandQuery = store.expandQuery;
+    store.expandQuery = async () => [];
+    try {
+      const result = await sdk.searchCandidates({
+        query: "signal -absenttoken",
+        collection: "corpus",
+        candidates: {
+          rawLimitPerLeg: 28,
+          group: {
+            metadataKey: GROUP_KEY,
+            targetGroupsPerLeg: 10,
+          },
+        },
+        candidateLimit: 20,
+        limit: 20,
+        rerank: false,
+      });
+
+      expect(result.coverage.legs.map(leg => ({
+        query: leg.query,
+        queryType: leg.queryType,
+        source: leg.source,
+      }))).toEqual([
+        {
+          query: "signal -absenttoken",
+          queryType: "original",
+          source: "fts",
+        },
+        {
+          query: "signal -absenttoken",
+          queryType: "original",
+          source: "vec",
+        },
+      ]);
+    } finally {
+      store.expandQuery = actualExpandQuery;
+    }
+  });
+
   test("reports the 4096-row KNN cap and uses the caller's typed lexical fallback", async () => {
     const result = await sdk.searchCandidates({
       queries: [
@@ -600,6 +709,7 @@ describe("leg weights and backend coverage", () => {
     });
     expect(result.coverage.legs[0]!.vectorScans).toEqual([{
       collectionId: result.coverage.legs[0]!.vectorScans[0]!.collectionId,
+      collectionName: "cap",
       requestedK: 4_096,
       matchedChunks: 4_096,
       resolvedDocuments: 1,
@@ -630,22 +740,129 @@ describe("hydration boundary and validation", () => {
     });
     expect(result.results).toHaveLength(3);
     expect(hydrationReads).toBe(3);
+    expect(contextReads).toBe(3);
     expect(retrievalCalls).toHaveLength(1);
     expect(retrievalCalls[0]).toMatchObject({
       source: "fts",
       limit: 28,
       scope: ["corpus"],
-      retrieval: { includeBody: false },
+      retrieval: {
+        includeBody: false,
+        includeContext: false,
+      },
     });
     expect(retrievalCalls[0]!.returnedBodies.every(hasBody => !hasBody)).toBe(true);
+  });
+
+  test("counts an admitted source that disappears before hydration as unavailable", async () => {
+    resetObservations();
+    const actualSearchFts = store.searchFTS;
+    store.searchFTS = (query, limit, scope, filter, retrieval) => {
+      const results = actualSearchFts(query, limit, scope, filter, retrieval);
+      store.deactivateDocument("compact", "unicode.md");
+      return results;
+    };
+
+    let result;
+    try {
+      result = await sdk.searchCandidates({
+        queries: [{ type: "lex", query: "compactprobe" }],
+        collection: "compact",
+        candidates: {
+          rawLimitPerLeg: 1,
+          group: {
+            metadataKey: GROUP_KEY,
+            targetGroupsPerLeg: 1,
+          },
+        },
+        candidateLimit: 1,
+        limit: 1,
+        rerank: false,
+      });
+    } finally {
+      store.searchFTS = actualSearchFts;
+      await insertDocument(
+        "compact",
+        "unicode.md",
+        "Compact probe",
+        "compactprobe 😀 café",
+        { [GROUP_KEY]: "compact" },
+      );
+    }
+
+    expect(result.results).toEqual([]);
+    expect(result.coverage).toMatchObject({
+      fusedGroups: 1,
+      admittedGroups: 1,
+      unavailableGroups: 1,
+      returnedGroups: 0,
+    });
+    expect(contextReads).toBe(0);
+  });
+
+  test("applies minScore and limit before reporting returnedGroups", async () => {
+    resetObservations();
+    const byLimit = await sdk.searchCandidates({
+      ...candidates([{ type: "lex", query: "signal" }]),
+      candidateLimit: 5,
+      limit: 2,
+    });
+    const limitContextReads = contextReads;
+    resetObservations();
+    const byScore = await sdk.searchCandidates({
+      ...candidates([{ type: "lex", query: "signal" }]),
+      candidateLimit: 5,
+      limit: 5,
+      minScore: 0.4,
+    });
+
+    expect(byLimit.results.map(hit => hit.rrfRank)).toEqual([1, 2]);
+    expect(byLimit.coverage).toMatchObject({
+      admittedGroups: 5,
+      returnedGroups: 2,
+    });
+    expect(limitContextReads).toBe(2);
+    expect(byScore.results.map(hit => hit.rrfRank)).toEqual([1, 2]);
+    expect(byScore.coverage).toMatchObject({
+      admittedGroups: 5,
+      returnedGroups: 2,
+    });
+    expect(contextReads).toBe(2);
+  });
+
+  test("skips chunk selection when reranking and evidence are disabled", async () => {
+    const options = candidates([{ type: "lex", query: "signal" }]);
+    options.candidateLimit = 3;
+    let chunkStrategyReads = 0;
+    Object.defineProperty(options, "chunkStrategy", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        chunkStrategyReads++;
+        return "auto";
+      },
+    });
+
+    const result = await sdk.searchCandidates(options);
+
+    expect(result.results).toHaveLength(3);
+    expect(chunkStrategyReads).toBe(0);
   });
 
   test("requires exactly one query form before retrieval", async () => {
     resetObservations();
     const base = candidates([{ type: "lex", query: "signal" }]);
-    await expect(sdk.searchCandidates({ ...base, queries: undefined }))
+    // @ts-expect-error Exercise the runtime guard for JavaScript callers with no query form.
+    await expect(sdk.searchCandidates({
+      ...base,
+      queries: undefined,
+    }))
       .rejects.toThrow("requires exactly one of query or queries");
-    await expect(sdk.searchCandidates({ ...base, query: "signal" }))
+    // @ts-expect-error Exercise the runtime guard for JavaScript callers with both query forms.
+    await expect(sdk.searchCandidates({
+      ...base,
+      query: "signal",
+    }))
       .rejects.toThrow("requires exactly one of query or queries");
     expect(retrievalCalls).toHaveLength(0);
   });

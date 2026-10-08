@@ -48,6 +48,7 @@ import {
 } from "./store-migrations.js";
 import type { Database, SQLiteValue } from "./db.js";
 import { inspectVectorIndex, type VectorIndexInspection } from "./vector-inspection.js";
+import { normalizeCjkForFTS, parseLexicalQuery } from "./lexical-query.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
@@ -64,6 +65,7 @@ import {
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
   type RerankDocument,
+  type RerankTokenBudget,
   type ILLMSession,
 } from "./llm.js";
 import type {
@@ -83,6 +85,8 @@ import {
   parseMetadataJson,
   type MetadataKeyOverview,
 } from "./metadata-store.js";
+
+export { normalizeCjkForFTS, sanitizeFTS5Term } from "./lexical-query.js";
 
 // =============================================================================
 // Configuration
@@ -920,35 +924,7 @@ export function verifySqliteVecLoaded(db: Database): void {
 
 let _sqliteVecAvailable: boolean | null = null;
 
-const CJK_CHAR_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-const CJK_RUN_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 const FTS_CJK_NORMALIZED_VERSION = "1";
-
-/**
- * FTS5's unicode61 tokenizer does not segment CJK text into searchable words.
- * Normalize CJK runs by spacing every character so exact CJK queries can be
- * translated into phrase queries while Latin text keeps the default tokenizer.
- */
-export function normalizeCjkForFTS(text: string): string {
-  return text.replace(CJK_RUN_PATTERN, run => ` ${Array.from(run).join(' ')} `);
-}
-
-function containsCjk(text: string): boolean {
-  return CJK_CHAR_PATTERN.test(text);
-}
-
-function sanitizeFTS5Phrase(phrase: string): string {
-  // A quoted phrase is matched against tokens the porter unicode61 tokenizer
-  // produced, and that tokenizer splits document text on every separator.
-  // Deleting the separators here instead would collapse "1.0.21" to "1021" and
-  // "PIO-1384" to "pio1384", tokens no document holds, so the query returns
-  // nothing with no error (#757 for dots, #916 for the rest). Split on the same
-  // separators the tokenizer does and emit the parts as adjacent phrase terms.
-  return normalizeCjkForFTS(phrase)
-    .split(/\s+/)
-    .flatMap(t => splitFTS5CompoundTerm(t))
-    .join(' ');
-}
 
 // FTS sync triggers keep documents_fts current for callers that write directly
 // to documents (production indexing rebuilds FTS in TypeScript to normalize CJK
@@ -1631,6 +1607,7 @@ export type Store = {
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
+  getRerankTokenBudget: (query: string, intent?: string) => Promise<RerankTokenBudget>;
   /** Drop the cached expansion for a query so the next call regenerates. */
   invalidateExpansionCache: (query: string) => void;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
@@ -2630,8 +2607,13 @@ export function createStore(dbPath?: string): Store {
     getIndexHealth: (model?: string) => getIndexHealth(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
     inspectVectorIndex: (model?: string) => {
       const selectedModel = model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL;
-      return inspectVectorIndex(db, selectedModel, getEmbeddingFingerprint(selectedModel),
-        () => getHashesNeedingEmbedding(db, undefined, selectedModel));
+      const embeddingFingerprint = getEmbeddingFingerprint(selectedModel);
+      return inspectVectorIndex(
+        db,
+        selectedModel,
+        embeddingFingerprint,
+        () => getHashesNeedingEmbedding(db, undefined, selectedModel),
+      );
     },
     getStatus: (model?: string) => getStatus(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
     getStatusSummary: (model?: string) => getStatusSummary(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
@@ -2669,6 +2651,7 @@ export function createStore(dbPath?: string): Store {
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
+    getRerankTokenBudget: (query, intent) => getLlm(store).getRerankTokenBudget(formatRerankQuery(query, intent)),
     invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
       // Cache keys must use the resolved rerank model (store.llm or the global
@@ -4531,37 +4514,6 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // FTS Search
 // =============================================================================
 
-export function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}'_]/gu, '').toLowerCase();
-}
-
-/**
- * A run of characters the FTS tokenizer treats as a separator.
- *
- * `documents_fts` is tokenized with `porter unicode61`, which starts a new
- * token at every character that is not a letter or a digit. Underscore is one
- * of those, but it is deliberately kept here rather than split on: FTS5 applies
- * the same tokenizer to a quoted phrase, so leaving `apply_secrets` intact lets
- * it split symmetrically into `apply secrets` on both sides, and that is the
- * behaviour #305 shipped. The apostrophe is kept for the same reason.
- */
-const FTS5_SEPARATOR_RUN = /[^\p{L}\p{N}'_]+/u;
-
-/**
- * Split one query term the way the tokenizer split the document text, and
- * sanitize each part.
- *
- * `PIO-1384` becomes ["pio", "1384"], `src/lib/i18n.ts` becomes
- * ["src", "lib", "i18n", "ts"], and a term with no separator in it comes back
- * as a single part. Callers join the parts into an FTS5 phrase, which is what
- * makes the parts have to be adjacent in the document rather than merely all
- * present. Parts that sanitize to nothing are dropped, so a term that is all
- * punctuation yields an empty list and the caller skips it.
- */
-function splitFTS5CompoundTerm(term: string): string[] {
-  return term.split(FTS5_SEPARATOR_RUN).map(p => sanitizeFTS5Term(p)).filter(p => p);
-}
-
 /**
  * Parse lex query syntax into FTS5 query.
  *
@@ -4590,89 +4542,13 @@ function splitFTS5CompoundTerm(term: string): string[] {
  *   src/lib/i18n.ts         → "src lib i18n ts"
  */
 function buildFTS5Query(query: string): string | null {
-  const positive: string[] = [];
-  const negative: string[] = [];
-
-  let i = 0;
-  const s = query.trim();
-
-  while (i < s.length) {
-    // Skip whitespace
-    while (i < s.length && /\s/.test(s[i]!)) i++;
-    if (i >= s.length) break;
-
-    // Check for negation prefix
-    const negated = s[i] === '-';
-    if (negated) i++;
-
-    // Check for quoted phrase
-    if (s[i] === '"') {
-      const start = i + 1;
-      i++;
-      while (i < s.length && s[i] !== '"') i++;
-      const phrase = s.slice(start, i).trim();
-      i++; // skip closing quote
-      if (phrase.length > 0) {
-        const sanitized = sanitizeFTS5Phrase(phrase);
-        if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // Exact phrase, no prefix match
-          if (negated) {
-            negative.push(ftsPhrase);
-          } else {
-            positive.push(ftsPhrase);
-          }
-        }
-      }
-    } else {
-      // Plain term (until whitespace or quote)
-      const start = i;
-      while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
-      const term = s.slice(start, i);
-
-      if (containsCjk(term)) {
-        const sanitized = sanitizeFTS5Phrase(term);
-        if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // CJK phrase over character tokens
-          if (negated) {
-            negative.push(ftsPhrase);
-          } else {
-            positive.push(ftsPhrase);
-          }
-        }
-      } else {
-        // Any separator inside the term (multi-agent, DEC-0054, 2026.4.10,
-        // src/lib/i18n.ts, @tobilu/qmd) split it at index time too, so the term
-        // has to be matched as the phrase those parts form. A term with no
-        // separator is one part and keeps its prefix match, which is what makes
-        // a plain word still match longer words that start with it.
-        const parts = splitFTS5CompoundTerm(term);
-        if (parts.length > 0) {
-          const ftsTerm = parts.length > 1
-            ? `"${parts.join(' ')}"`   // Phrase match (no prefix)
-            : `"${parts[0]}"*`;        // Prefix match
-          if (negated) {
-            negative.push(ftsTerm);
-          } else {
-            positive.push(ftsTerm);
-          }
-        }
-      }
-    }
-  }
-
-  if (positive.length === 0 && negative.length === 0) return null;
-
-  // If only negative terms, we can't search (FTS5 NOT is binary)
+  const clauses = parseLexicalQuery(query);
+  const positive = clauses.filter(clause => !clause.negated).map(clause => clause.ftsExpression);
+  const negative = clauses.filter(clause => clause.negated).map(clause => clause.ftsExpression);
   if (positive.length === 0) return null;
 
-  // Join positive terms with AND
-  let result = positive.join(' AND ');
-
-  // Add NOT clause for negative terms
-  for (const neg of negative) {
-    result = `${result} NOT ${neg}`;
-  }
-
+  let result = positive.join(" AND ");
+  for (const expression of negative) result += ` NOT ${expression}`;
   return result;
 }
 
@@ -4717,6 +4593,7 @@ function compareFilepaths(a: { filepath: string }, b: { filepath: string }): num
 
 export type VectorScanCoverage = {
   collectionId: number | null;
+  collectionName: string | null;
   requestedK: number;
   matchedChunks: number;
   resolvedDocuments: number;
@@ -4726,6 +4603,8 @@ export type VectorScanCoverage = {
 export type SearchRetrievalOptions = {
   /** Compact retrieval defers document bodies until candidate admission. */
   includeBody?: boolean;
+  /** Defer context lookup until final representative selection. */
+  includeContext?: boolean;
   /** Reports the final KNN scan of each collection target. */
   onVectorScan?: (coverage: VectorScanCoverage) => void;
 };
@@ -4814,7 +4693,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       modifiedAt: "",  // Not available in FTS query
       bodyLength: retrieval?.includeBody === false ? row.body_length : row.body.length,
       ...(retrieval?.includeBody === false ? {} : { body: row.body }),
-      context: getContextForFile(db, row.filepath),
+      context: retrieval?.includeContext === false ? null : getContextForFile(db, row.filepath),
       metadata: parseMetadataJson(row.metadata_json),
       score,
       source: "fts" as const,
@@ -4837,6 +4716,7 @@ interface VecMatch {
 /** One KNN scan target: a collection's partition, or the whole table when no scope is given. */
 interface VecScanTarget {
   collectionId?: number;
+  collectionName?: string;
 }
 
 /** The document behind a vector match, at its nearest chunk. */
@@ -4999,6 +4879,7 @@ function nearestVecDocuments(
     if (documents.length >= limit || matches.length < vecK || vecK === SQLITE_VEC_MAX_K) {
       onScan?.({
         collectionId: target.collectionId ?? null,
+        collectionName: target.collectionName ?? null,
         requestedK: vecK,
         matchedChunks: matches.length,
         resolvedDocuments: documents.length,
@@ -5016,9 +4897,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
   if (!embedding) return [];
 
   const names = scopedCollectionNames(collectionName);
+  const collectionNamesById = new Map<number, string>();
   let collectionIds: number[] | undefined;
   if (names) {
-    collectionIds = Array.from(resolveCollectionIds(db, names).values());
+    const ids = resolveCollectionIds(db, names);
+    collectionIds = Array.from(ids.values());
+    for (const [name, id] of ids) collectionNamesById.set(id, name);
     if (collectionIds.length === 0) return [];
   }
   const eligible = filter ? metadataEligibleCollections(db, filter) : undefined;
@@ -5034,7 +4918,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // value only because SQLite runs vec0's filter once per value, which is a
   // planner detail rather than a vec0 contract.
   const scanned = collectionIds && eligible ? collectionIds.filter(id => eligible.has(id)) : collectionIds;
-  const scanTargets: VecScanTarget[] = scanned ? scanned.map(collectionId => ({ collectionId })) : eligible?.size === 0 ? [] : [{}];
+  const scanTargets: VecScanTarget[] = scanned
+    ? scanned.map(collectionId => ({ collectionId, collectionName: collectionNamesById.get(collectionId) }))
+    : eligible?.size === 0 ? [] : [{}];
   if (scanTargets.length === 0) return [];
   const scan = knnVecScanner(db, collectionIds !== undefined, filter);
   const resolve = vecDocumentResolver(db, filter);
@@ -5069,7 +4955,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         modifiedAt: "",  // Not available in vec query
         bodyLength: retrieval?.includeBody === false ? content.body_length : body.length,
         ...(retrieval?.includeBody === false ? {} : { body }),
-        context: getContextForFile(db, row.filepath),
+        context: retrieval?.includeContext === false ? null : getContextForFile(db, row.filepath),
         metadata: parseMetadataJson(row.metadata_json),
         score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
@@ -5355,9 +5241,13 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
+export function formatRerankQuery(query: string, intent?: string): string {
+  return intent ? `${intent}\n\n${query}` : query;
+}
+
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
-  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+  const rerankQuery = formatRerankQuery(query, intent);
   const llm = llmOverride ?? getDefaultLlamaCpp();
   // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
   // reuse another model's cache entries (#764).
@@ -5407,12 +5297,30 @@ export async function rerank(query: string, documents: { file: string; text: str
 // Reciprocal Rank Fusion
 // =============================================================================
 
-export function reciprocalRankFusion(
-  resultLists: RankedResult[][],
+const DEFAULT_RRF_K = 60;
+
+export function rrfContribution(rank: number, weight: number, k: number = DEFAULT_RRF_K): number {
+  return weight / (k + rank);
+}
+
+export function rrfTopRankBonus(rank: number): number {
+  if (rank === 1) return 0.05;
+  if (rank <= 3) return 0.02;
+  return 0;
+}
+
+export function rrfPositionWeight(rank: number): number {
+  if (rank <= 3) return 0.75;
+  if (rank <= 10) return 0.60;
+  return 0.40;
+}
+
+export function reciprocalRankFusion<T extends { file: string; score: number }>(
+  resultLists: T[][],
   weights: number[] = [],
-  k: number = 60
-): RankedResult[] {
-  const scores = new Map<string, { result: RankedResult; rrfScore: number; topRank: number }>();
+  k: number = DEFAULT_RRF_K
+): T[] {
+  const scores = new Map<string, { result: T; rrfScore: number; topRank: number }>();
 
   for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
     const list = resultLists[listIdx];
@@ -5422,16 +5330,16 @@ export function reciprocalRankFusion(
     for (let rank = 0; rank < list.length; rank++) {
       const result = list[rank];
       if (!result) continue;
-      const rrfContribution = weight / (k + rank + 1);
+      const contribution = rrfContribution(rank + 1, weight, k);
       const existing = scores.get(result.file);
 
       if (existing) {
-        existing.rrfScore += rrfContribution;
+        existing.rrfScore += contribution;
         existing.topRank = Math.min(existing.topRank, rank);
       } else {
         scores.set(result.file, {
           result,
-          rrfScore: rrfContribution,
+          rrfScore: contribution,
           topRank: rank,
         });
       }
@@ -5440,11 +5348,7 @@ export function reciprocalRankFusion(
 
   // Top-rank bonus
   for (const entry of scores.values()) {
-    if (entry.topRank === 0) {
-      entry.rrfScore += 0.05;
-    } else if (entry.topRank <= 2) {
-      entry.rrfScore += 0.02;
-    }
+    entry.rrfScore += rrfTopRankBonus(entry.topRank + 1);
   }
 
   return Array.from(scores.values())
@@ -5459,7 +5363,7 @@ export function buildRrfTrace(
   resultLists: RankedResult[][],
   weights: number[] = [],
   listMeta: RankedListMeta[] = [],
-  k: number = 60
+  k: number = DEFAULT_RRF_K
 ): Map<string, RRFScoreTrace> {
   const traces = new Map<string, RRFScoreTrace>();
 
@@ -5477,7 +5381,7 @@ export function buildRrfTrace(
       const result = list[rank0];
       if (!result) continue;
       const rank = rank0 + 1; // 1-indexed rank for explain output
-      const contribution = weight / (k + rank);
+      const contribution = rrfContribution(rank, weight, k);
       const existing = traces.get(result.file);
 
       const detail: RRFContributionTrace = {
@@ -5508,9 +5412,7 @@ export function buildRrfTrace(
   }
 
   for (const trace of traces.values()) {
-    let bonus = 0;
-    if (trace.topRank === 1) bonus = 0.05;
-    else if (trace.topRank <= 3) bonus = 0.02;
+    const bonus = rrfTopRankBonus(trace.topRank);
     trace.topRankBonus = bonus;
     trace.totalScore = trace.baseScore + bonus;
   }
@@ -6066,6 +5968,27 @@ export const INTENT_WEIGHT_SNIPPET = 0.3;
 /** Weight for intent terms relative to query terms (1.0) in chunk selection */
 export const INTENT_WEIGHT_CHUNK = 0.5;
 
+export function selectBestChunkIndex(
+  chunks: readonly { text: string }[],
+  queryTerms: readonly string[],
+  intentTerms: readonly string[],
+): number {
+  let bestIndex = 0;
+  let bestScore = -1;
+  for (const [index, chunk] of chunks.entries()) {
+    const text = chunk.text.toLowerCase();
+    let score = queryTerms.reduce((sum, term) => sum + (text.includes(term) ? 1 : 0), 0);
+    for (const term of intentTerms) {
+      if (text.includes(term)) score += INTENT_WEIGHT_CHUNK;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
 // Common stop words filtered from intent strings before tokenization.
 // Seeded from finetune/reward.py KEY_TERM_STOPWORDS, extended with common
 // 2-3 char function words so the length threshold can drop to >1 and let
@@ -6287,6 +6210,12 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
 
+export function primaryQueryFor(queries: readonly ExpandedQuery[]): string {
+  return queries.find(query => query.type === "lex")?.query
+    || queries.find(query => query.type === "vec")?.query
+    || queries[0]?.query || "";
+}
+
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
  *
@@ -6455,16 +6384,7 @@ export async function hybridQuery(
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
+    const bestIdx = selectBestChunkIndex(chunks, queryTerms, intentTerms);
 
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
@@ -6543,10 +6463,7 @@ export async function hybridQuery(
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
+    const rrfWeight = rrfPositionWeight(rrfRank);
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
@@ -6836,9 +6753,7 @@ export async function structuredSearch(
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
   // Use first lex query as the "query" for keyword matching, or first vec if no lex
-  const primaryQuery = searches.find(s => s.type === 'lex')?.query
-    || searches.find(s => s.type === 'vec')?.query
-    || searches[0]?.query || "";
+  const primaryQuery = primaryQueryFor(searches);
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
@@ -6850,16 +6765,7 @@ export async function structuredSearch(
 
     // Pick chunk with most keyword overlap
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
+    const bestIdx = selectBestChunkIndex(chunks, queryTerms, intentTerms);
 
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
@@ -6937,10 +6843,7 @@ export async function structuredSearch(
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
+    const rrfWeight = rrfPositionWeight(rrfRank);
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 

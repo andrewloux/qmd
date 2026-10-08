@@ -1,9 +1,17 @@
 import { describe, expect, test } from "vitest";
 import {
+  normalizeCjkForFTS,
+  parseLexicalQuery,
+  sanitizeFTS5Term,
+} from "../src/lexical-query.js";
+import {
   boundedPassageWindow,
+  fitPassageWindow,
+  isUtf16Boundary,
   locateLexical,
   parsePositiveLexicalAnchors,
   selectionWindowLocation,
+  validatePassageBudget,
   vectorChunkLocation,
   type DocumentLocationRef,
 } from "../src/search-locations.js";
@@ -12,6 +20,47 @@ const REF: DocumentLocationRef = {
   uri: "qmd://threads/thread-orbit.md",
   contentHash: "sha256:orbit-thread-v3",
 };
+
+describe("lexical query grammar", () => {
+  test("preserves source clauses and compiles QMD's FTS expressions", () => {
+    expect(parseLexicalQuery(
+      'orbit -sports "refresh token" -"legacy tenant" pause-and-resume 認証 apply_secrets !!!',
+    )).toEqual([
+      { text: "orbit", negated: false, match: "prefix", ftsExpression: '"orbit"*' },
+      { text: "sports", negated: true, match: "prefix", ftsExpression: '"sports"*' },
+      {
+        text: "refresh token",
+        negated: false,
+        match: "phrase",
+        ftsExpression: '"refresh token"',
+      },
+      {
+        text: "legacy tenant",
+        negated: true,
+        match: "phrase",
+        ftsExpression: '"legacy tenant"',
+      },
+      {
+        text: "pause-and-resume",
+        negated: false,
+        match: "phrase",
+        ftsExpression: '"pause and resume"',
+      },
+      { text: "認証", negated: false, match: "phrase", ftsExpression: '"認 証"' },
+      {
+        text: "apply_secrets",
+        negated: false,
+        match: "prefix",
+        ftsExpression: '"apply_secrets"*',
+      },
+    ]);
+  });
+
+  test("keeps the established CJK and term sanitization output", () => {
+    expect(normalizeCjkForFTS("Auth認証한")).toBe("Auth 認 証 한 ");
+    expect(sanitizeFTS5Term("@Tobi/QMD's_apply!")).toBe("tobiqmd's_apply");
+  });
+});
 
 describe("positive lexical anchors", () => {
   test("keeps positive phrases and literals and excludes negative clauses", () => {
@@ -113,6 +162,15 @@ describe("lexical locations", () => {
       anchorClipped: true,
     });
   });
+
+  test("preserves reference validation precedence", () => {
+    expect(() => locateLexical(
+      "body",
+      "body",
+      { uri: "", contentHash: "" },
+      { maxUtf8Bytes: -1 },
+    )).toThrow("uri must contain at least one character");
+  });
 });
 
 describe("bounded passage windows", () => {
@@ -160,6 +218,114 @@ describe("bounded passage windows", () => {
     expect(passage.unicodeScalars).toBe(7);
     expect(passage.text.charCodeAt(0)).toBe(0xd83d);
     expect(passage.text.charCodeAt(passage.text.length - 1)).toBe(0xde00);
+  });
+
+  test("clips before an astral or three-byte scalar that exceeds the byte budget", () => {
+    const body = "😀€x";
+
+    expect(boundedPassageWindow(body, { startUtf16: 0, endUtf16: body.length }, {
+      maxUtf8Bytes: 3,
+    })).toEqual({
+      startUtf16: 0,
+      endUtf16: 0,
+      text: "",
+      utf8Bytes: 0,
+      unicodeScalars: 0,
+      anchorClipped: true,
+    });
+    expect(boundedPassageWindow(body, { startUtf16: 0, endUtf16: body.length }, {
+      maxUtf8Bytes: 6,
+    })).toMatchObject({
+      startUtf16: 0,
+      endUtf16: 2,
+      text: "😀",
+      utf8Bytes: 4,
+      unicodeScalars: 1,
+      anchorClipped: true,
+    });
+  });
+
+  test("validates copied budgets and UTF-16 scalar boundaries", () => {
+    const budget = { maxUtf8Bytes: 12, maxUnicodeScalars: 7 };
+    const validated = validatePassageBudget(budget);
+
+    expect(validated).toEqual(budget);
+    expect(validated).not.toBe(budget);
+    expect(isUtf16Boundary("a😀b", 1)).toBe(true);
+    expect(isUtf16Boundary("a😀b", 2)).toBe(false);
+    expect(isUtf16Boundary("a😀b", 3)).toBe(true);
+    expect(isUtf16Boundary("a😀b", 1.5)).toBe(false);
+    expect(isUtf16Boundary("a😀b", 5)).toBe(false);
+  });
+});
+
+describe("reranker passage fitting", () => {
+  test("retains the full anchor when the anchor fits the reranker", () => {
+    const body = "0123456789ANCHORabcdefghij";
+    const anchor = { startUtf16: 10, endUtf16: 16 };
+    const passage = fitPassageWindow(body, anchor, { maxUtf8Bytes: body.length }, {
+      maxDocumentTokens: 6,
+      countTokens: text => text.length,
+    });
+
+    expect(passage.text).toBe("ANCHOR");
+    expect(passage.anchorClipped).toBe(false);
+    expect(body.slice(passage.startUtf16, passage.endUtf16)).toBe(passage.text);
+  });
+
+  test("retains a measured fit when token counts are nonmonotonic", () => {
+    const body = "0123456789ANCHORabcdefghij";
+    const anchor = { startUtf16: 10, endUtf16: 16 };
+    const countTokens = (text: string): number => text.length === 11 ? 6 : text.length;
+    const passage = fitPassageWindow(body, anchor, { maxUtf8Bytes: body.length }, {
+      maxDocumentTokens: 6,
+      countTokens,
+    });
+
+    expect(passage.text).toHaveLength(11);
+    expect(passage.text).toContain("ANCHOR");
+    expect(countTokens(passage.text)).toBeLessThanOrEqual(6);
+    expect(body.slice(passage.startUtf16, passage.endUtf16)).toBe(passage.text);
+  });
+
+  test("returns an honest clipped anchor for a zero-token document budget", () => {
+    const body = "leftANCHORright";
+    const passage = fitPassageWindow(
+      body,
+      { startUtf16: 4, endUtf16: 10 },
+      { maxUtf8Bytes: body.length },
+      { maxDocumentTokens: 0, countTokens: text => text.length },
+    );
+
+    expect(passage).toEqual({
+      startUtf16: 4,
+      endUtf16: 4,
+      text: "",
+      utf8Bytes: 0,
+      unicodeScalars: 0,
+      anchorClipped: true,
+    });
+  });
+
+  test("honors the caller scalar cap while clipping an oversized multibyte anchor", () => {
+    const body = "x😀€abcy";
+    const passage = fitPassageWindow(
+      body,
+      { startUtf16: 1, endUtf16: 7 },
+      { maxUtf8Bytes: 100, maxUnicodeScalars: 3 },
+      { maxDocumentTokens: 2, countTokens: text => Array.from(text).length },
+    );
+
+    expect(passage).toEqual({
+      startUtf16: 1,
+      endUtf16: 4,
+      text: "😀€",
+      utf8Bytes: 7,
+      unicodeScalars: 2,
+      anchorClipped: true,
+    });
+    expect(isUtf16Boundary(body, passage.endUtf16)).toBe(true);
+    expect(body.slice(passage.startUtf16, passage.endUtf16)).toBe(passage.text);
   });
 });
 

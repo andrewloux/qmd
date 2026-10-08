@@ -20,6 +20,7 @@ export type VectorPartitionState = "absent" | "legacy" | "unreadable" | "checked
 export type VectorIndexInspection = {
   model: string;
   embeddingFingerprint: string;
+  /** `checked` means the partition table was readable and its peer scan completed. */
   partitionState: VectorPartitionState;
   activeDocuments: number;
   needsEmbedding: number;
@@ -45,16 +46,15 @@ type RequiredPartitionRow = {
 type MappingRow = {
   rowid: number | bigint;
   collectionId: SQLiteValue;
-  knownCollectionId: SQLiteValue;
-  contentHash: string | null;
+  registeredCollectionId: SQLiteValue;
+  recordedChunkHash: string | null;
 };
 
 type VectorRow = {
   rowid: number | bigint;
-  collectionId: SQLiteValue;
 };
 
-function safeInteger(value: SQLiteValue): bigint | undefined {
+function normalizeInteger(value: SQLiteValue): bigint | undefined {
   if (typeof value === "number") {
     return Number.isSafeInteger(value) ? BigInt(value) : undefined;
   }
@@ -63,9 +63,9 @@ function safeInteger(value: SQLiteValue): bigint | undefined {
 }
 
 function sameInteger(left: SQLiteValue, right: SQLiteValue): boolean {
-  const safeLeft = safeInteger(left);
-  const safeRight = safeInteger(right);
-  return safeLeft !== undefined && safeRight !== undefined && safeLeft === safeRight;
+  const normalizedLeft = normalizeInteger(left);
+  const normalizedRight = normalizeInteger(right);
+  return normalizedLeft !== undefined && normalizedRight !== undefined && normalizedLeft === normalizedRight;
 }
 
 function countActiveDocuments(db: Database): number {
@@ -101,7 +101,18 @@ function countInconsistentChunkLayouts(
       JOIN active_hashes ah ON ah.hash = cv.hash
       WHERE cv.model = ? AND cv.embed_fingerprint = ?
     ),
-    position_layouts AS (
+    sequence_checks AS (
+      SELECT
+        hash,
+        SUM(CASE WHEN
+          typeof(seq) != 'integer'
+          OR seq < 0
+          OR seq > 9007199254740991
+        THEN 1 ELSE 0 END) AS invalid_sequences
+      FROM selected_chunks
+      GROUP BY hash
+    ),
+    position_checks AS (
       SELECT
         hash,
         SUM(CASE WHEN
@@ -114,13 +125,13 @@ function countInconsistentChunkLayouts(
       FROM selected_chunks
       GROUP BY hash
     ),
-    all_layouts AS (
-      SELECT ah.hash, COUNT(cv.seq) AS all_count
+    all_chunk_counts AS (
+      SELECT ah.hash, COUNT(cv.seq) AS stored_count
       FROM active_hashes ah
       LEFT JOIN content_vectors cv ON cv.hash = ah.hash
       GROUP BY ah.hash
     ),
-    selected_layouts AS (
+    selected_chunk_layouts AS (
       SELECT
         ah.hash,
         COUNT(cv.seq) AS selected_count,
@@ -137,21 +148,23 @@ function countInconsistentChunkLayouts(
       GROUP BY ah.hash
     )
     SELECT COUNT(*) AS count
-    FROM all_layouts a
-    JOIN selected_layouts s ON s.hash = a.hash
-    LEFT JOIN position_layouts p ON p.hash = a.hash
+    FROM all_chunk_counts all_chunks
+    JOIN selected_chunk_layouts selected ON selected.hash = all_chunks.hash
+    LEFT JOIN sequence_checks sequences ON sequences.hash = all_chunks.hash
+    LEFT JOIN position_checks positions ON positions.hash = all_chunks.hash
     WHERE
-      a.all_count != s.selected_count
-      OR COALESCE(p.invalid_positions, 0) > 0
+      all_chunks.stored_count != selected.selected_count
+      OR COALESCE(sequences.invalid_sequences, 0) > 0
+      OR COALESCE(positions.invalid_positions, 0) > 0
       OR (
-        s.selected_count > 0
+        selected.selected_count > 0
         AND (
-          s.total_count != s.selected_count
-          OR s.min_total != s.max_total
-          OR s.max_total < 1
-          OR s.selected_count != s.max_total
-          OR s.min_seq != 0
-          OR s.max_seq != s.max_total - 1
+          selected.total_count != selected.selected_count
+          OR selected.min_total != selected.max_total
+          OR selected.max_total < 1
+          OR selected.selected_count != selected.max_total
+          OR selected.min_seq != 0
+          OR selected.max_seq != selected.max_total - 1
         )
       )
   `).get(model, embeddingFingerprint, model, embeddingFingerprint) as { count: number };
@@ -163,7 +176,7 @@ function countInconsistentChunkLayouts(
  * model and fingerprint. Active hashes with absent or incomplete current
  * chunks are represented by needsEmbedding, supplied by the caller.
  */
-function requiredPartitionRows(
+function iterateRequiredPartitionRows(
   db: Database,
   model: string,
   embeddingFingerprint: string,
@@ -185,15 +198,15 @@ function requiredPartitionRows(
   `).iterate<RequiredPartitionRow>(model, embeddingFingerprint);
 }
 
-function inspectCheckedPartitions(
+function inspectReadablePartitions(
   db: Database,
-  required: Iterable<RequiredPartitionRow>,
+  requiredRows: Iterable<RequiredPartitionRow>,
 ): { requiredPartitionRows: number; missingRequiredPartitionRows: number; inconsistentPeerRows: number } {
   const vectorByRowid = db.prepare(`SELECT collection_id AS collectionId FROM ${VEC_TABLE} WHERE rowid = ?`);
   let requiredPartitionRows = 0;
   let missingRequiredPartitionRows = 0;
 
-  for (const row of required) {
+  for (const row of requiredRows) {
     requiredPartitionRows++;
     if (row.rowid === null || row.collectionId === null) {
       missingRequiredPartitionRows++;
@@ -212,8 +225,8 @@ function inspectCheckedPartitions(
     SELECT
       vr.id AS rowid,
       vr.collection_id AS collectionId,
-      ci.id AS knownCollectionId,
-      cv.hash AS contentHash
+      ci.id AS registeredCollectionId,
+      cv.hash AS recordedChunkHash
     FROM ${VEC_ROWS_TABLE} vr
     LEFT JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
     LEFT JOIN content_vectors cv ON cv.hash = vr.hash AND cv.seq = vr.seq
@@ -224,15 +237,15 @@ function inspectCheckedPartitions(
     if (
       !vector ||
       !sameInteger(vector.collectionId, mapping.collectionId) ||
-      mapping.knownCollectionId === null ||
-      mapping.contentHash === null
+      mapping.registeredCollectionId === null ||
+      mapping.recordedChunkHash === null
     ) {
       inconsistentPeerRows++;
     }
   }
 
   const mappingByRowid = db.prepare(`SELECT collection_id AS collectionId FROM ${VEC_ROWS_TABLE} WHERE id = ?`);
-  const vectors = db.prepare(`SELECT rowid, collection_id AS collectionId FROM ${VEC_TABLE}`);
+  const vectors = db.prepare(`SELECT rowid FROM ${VEC_TABLE}`);
   for (const vector of vectors.iterate<VectorRow>()) {
     const mapping = mappingByRowid.get<{ collectionId: SQLiteValue }>(vector.rowid);
     // A mapped mismatch was counted during the mapping pass. This pass adds
@@ -243,13 +256,13 @@ function inspectCheckedPartitions(
   return { requiredPartitionRows, missingRequiredPartitionRows, inconsistentPeerRows };
 }
 
-function countRequiredPartitionRows(required: Iterable<RequiredPartitionRow>): number {
+function countRequiredPartitionRows(requiredRows: Iterable<RequiredPartitionRow>): number {
   let count = 0;
-  for (const _row of required) count++;
+  for (const _row of requiredRows) count++;
   return count;
 }
 
-function structurallyReady(
+function isStructurallyReady(
   partitionState: VectorPartitionState,
   activeDocuments: number,
   needsEmbedding: number,
@@ -285,17 +298,24 @@ function inspectVectorIndexInSnapshot(
 
   if (layout.kind === "legacy") {
     partitionState = "legacy";
-    requiredPartitionRowCount = countRequiredPartitionRows(requiredPartitionRows(db, model, embeddingFingerprint));
+    requiredPartitionRowCount = countRequiredPartitionRows(
+      iterateRequiredPartitionRows(db, model, embeddingFingerprint),
+    );
     missingRequiredPartitionRows = null;
     inconsistentPeerRows = null;
   } else if (layout.kind === "none") {
     partitionState = "absent";
-    requiredPartitionRowCount = countRequiredPartitionRows(requiredPartitionRows(db, model, embeddingFingerprint));
+    requiredPartitionRowCount = countRequiredPartitionRows(
+      iterateRequiredPartitionRows(db, model, embeddingFingerprint),
+    );
     missingRequiredPartitionRows = requiredPartitionRowCount;
-    inconsistentPeerRows = (db.prepare(`SELECT COUNT(*) AS count FROM ${VEC_ROWS_TABLE}`).get() as { count: number }).count;
+    const mappingCount = db.prepare(`SELECT COUNT(*) AS count FROM ${VEC_ROWS_TABLE}`).get() as { count: number };
+    inconsistentPeerRows = mappingCount.count;
   } else if (!vecTableReadable(db, layout)) {
     partitionState = "unreadable";
-    requiredPartitionRowCount = countRequiredPartitionRows(requiredPartitionRows(db, model, embeddingFingerprint));
+    requiredPartitionRowCount = countRequiredPartitionRows(
+      iterateRequiredPartitionRows(db, model, embeddingFingerprint),
+    );
     missingRequiredPartitionRows = null;
     inconsistentPeerRows = null;
   } else {
@@ -304,7 +324,7 @@ function inspectVectorIndexInSnapshot(
       requiredPartitionRows: requiredPartitionRowCount,
       missingRequiredPartitionRows,
       inconsistentPeerRows,
-    } = inspectCheckedPartitions(db, requiredPartitionRows(db, model, embeddingFingerprint)));
+    } = inspectReadablePartitions(db, iterateRequiredPartitionRows(db, model, embeddingFingerprint)));
   }
 
   return {
@@ -317,7 +337,7 @@ function inspectVectorIndexInSnapshot(
     requiredPartitionRows: requiredPartitionRowCount,
     missingRequiredPartitionRows,
     inconsistentPeerRows,
-    structurallyReady: structurallyReady(
+    structurallyReady: isStructurallyReady(
       partitionState,
       activeDocuments,
       needsEmbedding,
@@ -330,9 +350,10 @@ function inspectVectorIndexInSnapshot(
 
 /**
  * Inspect the selected embedding generation and the physical vec0/mapping
- * relationship in one SQLite snapshot. This is an O(vector rows) diagnostic
- * intended for publication gates and explicit health checks, not the ordinary
- * status path.
+ * relationship in one SQLite snapshot. Work scales with active chunk records,
+ * required partition rows, and physical mapping/vector rows. Publication gates
+ * and explicit health checks call this diagnostic. getIndexHealth() serves the
+ * ordinary status path.
  */
 export function inspectVectorIndex(
   db: Database,
@@ -340,11 +361,11 @@ export function inspectVectorIndex(
   embeddingFingerprint: string,
   countNeedsEmbedding: () => number,
 ): VectorIndexInspection {
-  const inspect = db.transaction(() => inspectVectorIndexInSnapshot(
+  const runInspection = db.transaction(() => inspectVectorIndexInSnapshot(
     db,
     model,
     embeddingFingerprint,
     countNeedsEmbedding,
   ));
-  return inspect();
+  return runInspection();
 }

@@ -1,5 +1,5 @@
 /**
- * The SDK exposes deep vector inspection as an explicit diagnostic while its
+ * The SDK exposes deep vector inspection as an explicit diagnostic. Its
  * existing health call keeps the same cheap result and model default.
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -18,18 +18,18 @@ interface RuntimeVectorInspector {
 
 let testDir: string;
 let docsDir: string;
-let stores: QMDStore[];
+let sdkStore: QMDStore | undefined;
 
 beforeEach(async () => {
   testDir = await mkdtemp(join(tmpdir(), "qmd-sdk-vector-inspection-"));
   docsDir = join(testDir, "docs");
   await mkdir(docsDir);
-  stores = [];
+  sdkStore = undefined;
 });
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  await Promise.all(stores.map(store => store.close()));
+  await sdkStore?.close();
   await rm(testDir, { recursive: true, force: true });
 });
 
@@ -43,7 +43,7 @@ async function openStore(): Promise<QMDStore> {
       models: { embed: SELECTED_MODEL },
     },
   });
-  stores.push(store);
+  sdkStore = store;
   return store;
 }
 
@@ -110,13 +110,13 @@ describe("QMDStore.inspectVectorIndex", () => {
 
   test("rejects invalid models before delegating to the database inspector", async () => {
     const store = await openStore();
-    const inspect = vi.spyOn(store.internal, "inspectVectorIndex");
+    const inspectSpy = vi.spyOn(store.internal, "inspectVectorIndex");
     const runtimeStore: RuntimeVectorInspector = store;
 
     await expect(store.inspectVectorIndex({ model: "" })).rejects.toThrow("model must be a non-empty string");
     await expect(store.inspectVectorIndex({ model: "   " })).rejects.toThrow("model must be a non-empty string");
     await expect(runtimeStore.inspectVectorIndex({ model: 42 }))
       .rejects.toThrow("model must be a non-empty string");
-    expect(inspect).not.toHaveBeenCalled();
+    expect(inspectSpy).not.toHaveBeenCalled();
   });
 });

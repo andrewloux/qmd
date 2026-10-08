@@ -46,19 +46,19 @@ afterEach(async () => {
   dir = null;
 });
 
-function insertDoc(s: Store, collection: string, hash: string, path: string): void {
+function seedDocument(s: Store, collection: string, hash: string, path: string): void {
   const now = new Date().toISOString();
   insertContent(s.db, hash, `# ${hash}\n\nBody for ${hash}.`, now);
   insertDocument(s.db, collection, path, hash, hash, now, now);
 }
 
-function insertVector(s: Store, collection: string, hash: string): void {
+function seedPartitionVector(s: Store, collection: string, hash: string): void {
   const now = new Date().toISOString();
   s.insertEmbedding(hash, 0, 0, new Float32Array([1, 2, 3]), MODEL, now, 1, getEmbeddingFingerprint(MODEL));
   expect(resolveCollectionId(s.db, collection)).toBeDefined();
 }
 
-function inspect(s: Store, model: string = MODEL) {
+function inspectStore(s: Store, model: string = MODEL) {
   return inspectVectorIndex(
     s.db,
     model,
@@ -67,7 +67,7 @@ function inspect(s: Store, model: string = MODEL) {
   );
 }
 
-function mappedRow(s: Store, hash: string): { rowid: number; collectionId: number } {
+function requireVectorMapping(s: Store, hash: string): { rowid: number; collectionId: number } {
   const row = s.db.prepare(`
     SELECT id AS rowid, collection_id AS collectionId
     FROM ${VEC_ROWS_TABLE}
@@ -77,7 +77,7 @@ function mappedRow(s: Store, hash: string): { rowid: number; collectionId: numbe
   return row;
 }
 
-class FakeLlm extends LlamaCpp {
+class FixedEmbeddingLlm extends LlamaCpp {
   constructor() {
     super({ embedModel: MODEL });
   }
@@ -129,7 +129,7 @@ describe("inspectVectorIndex", () => {
 
   test("reports required active rows missing from an absent index", async () => {
     const s = await openStore();
-    insertDoc(s, "docs", "absent-hash", "absent.md");
+    seedDocument(s, "docs", "absent-hash", "absent.md");
     const now = new Date().toISOString();
     s.db.prepare(`
       INSERT INTO content_vectors
@@ -137,7 +137,7 @@ describe("inspectVectorIndex", () => {
       VALUES (?, 0, 0, ?, ?, 1, ?)
     `).run("absent-hash", MODEL, getEmbeddingFingerprint(MODEL), now);
 
-    expect(inspect(s)).toMatchObject({
+    expect(inspectStore(s)).toMatchObject({
       partitionState: "absent",
       activeDocuments: 1,
       needsEmbedding: 0,
@@ -148,9 +148,9 @@ describe("inspectVectorIndex", () => {
     });
   });
 
-  test("reports legacy vector storage without claiming peer counts", async () => {
+  test("reports legacy vector storage with unavailable peer counts", async () => {
     const s = await openStore();
-    insertDoc(s, "docs", "legacy-hash", "legacy.md");
+    seedDocument(s, "docs", "legacy-hash", "legacy.md");
     const now = new Date().toISOString();
     s.db.prepare(`
       INSERT INTO content_vectors
@@ -162,7 +162,7 @@ describe("inspectVectorIndex", () => {
       USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[3] distance_metric=cosine)
     `);
 
-    expect(inspect(s)).toMatchObject({
+    expect(inspectStore(s)).toMatchObject({
       partitionState: "legacy",
       activeDocuments: 1,
       needsEmbedding: 0,
@@ -176,8 +176,8 @@ describe("inspectVectorIndex", () => {
   test("reports an index opened without sqlite-vec as unreadable", async () => {
     const s = await openStore();
     s.ensureVecTable(3);
-    insertDoc(s, "docs", "unreadable-hash", "unreadable.md");
-    insertVector(s, "docs", "unreadable-hash");
+    seedDocument(s, "docs", "unreadable-hash", "unreadable.md");
+    seedPartitionVector(s, "docs", "unreadable-hash");
     const dbPath = s.dbPath;
     s.close();
     store = null;
@@ -205,13 +205,13 @@ describe("inspectVectorIndex", () => {
   test("scopes required rows to the selected model and accepts coherent inactive cache rows", async () => {
     const s = await openStore();
     s.ensureVecTable(3);
-    insertDoc(s, "docs", "active-hash", "active.md");
-    insertVector(s, "docs", "active-hash");
-    insertDoc(s, "archive", "cached-hash", "cached.md");
-    insertVector(s, "archive", "cached-hash");
+    seedDocument(s, "docs", "active-hash", "active.md");
+    seedPartitionVector(s, "docs", "active-hash");
+    seedDocument(s, "archive", "cached-hash", "cached.md");
+    seedPartitionVector(s, "archive", "cached-hash");
     deactivateDocument(s.db, "archive", "cached.md");
 
-    expect(inspect(s)).toEqual({
+    expect(inspectStore(s)).toEqual({
       model: MODEL,
       embeddingFingerprint: getEmbeddingFingerprint(MODEL),
       partitionState: "checked",
@@ -224,8 +224,8 @@ describe("inspectVectorIndex", () => {
       structurallyReady: true,
     });
 
-    const other = inspect(s, OTHER_MODEL);
-    expect(other).toMatchObject({
+    const otherModelInspection = inspectStore(s, OTHER_MODEL);
+    expect(otherModelInspection).toMatchObject({
       model: OTHER_MODEL,
       embeddingFingerprint: getEmbeddingFingerprint(OTHER_MODEL),
       needsEmbedding: 1,
@@ -235,23 +235,23 @@ describe("inspectVectorIndex", () => {
     });
   });
 
-  test("rejects excess, non-contiguous, and off-generation chunks missed by ordinary health", async () => {
+  test("reports excess, non-contiguous, and off-generation chunks as inconsistent", async () => {
     const s = await openStore();
     s.ensureVecTable(3);
     const now = new Date().toISOString();
     const fingerprint = getEmbeddingFingerprint(MODEL);
 
-    insertDoc(s, "docs", "excess", "excess.md");
+    seedDocument(s, "docs", "excess", "excess.md");
     for (const seq of [0, 1, 2, 3]) {
       s.insertEmbedding("excess", seq, seq * 10, new Float32Array([1, 2, 3]), MODEL, now, 3, fingerprint);
     }
 
-    insertDoc(s, "docs", "gap", "gap.md");
+    seedDocument(s, "docs", "gap", "gap.md");
     for (const seq of [0, 2, 3]) {
       s.insertEmbedding("gap", seq, seq * 10, new Float32Array([1, 2, 3]), MODEL, now, 3, fingerprint);
     }
 
-    insertDoc(s, "docs", "off-generation", "off-generation.md");
+    seedDocument(s, "docs", "off-generation", "off-generation.md");
     s.insertEmbedding("off-generation", 0, 0, new Float32Array([1, 2, 3]), MODEL, now, 1, fingerprint);
     s.insertEmbedding(
       "off-generation",
@@ -265,7 +265,7 @@ describe("inspectVectorIndex", () => {
     );
 
     expect(s.getHashesNeedingEmbedding(MODEL)).toBe(0);
-    expect(inspect(s)).toMatchObject({
+    expect(inspectStore(s)).toMatchObject({
       needsEmbedding: 0,
       inconsistentChunkLayouts: 3,
       requiredPartitionRows: 8,
@@ -275,11 +275,42 @@ describe("inspectVectorIndex", () => {
     });
   });
 
-  test("rejects a null total_chunks layout missed by ordinary health", async () => {
+  test("reports a non-integer chunk sequence as inconsistent", async () => {
     const s = await openStore();
     s.ensureVecTable(3);
-    insertDoc(s, "docs", "null-total", "null-total.md");
-    insertVector(s, "docs", "null-total");
+    const now = new Date().toISOString();
+    const fingerprint = getEmbeddingFingerprint(MODEL);
+
+    seedDocument(s, "docs", "fractional-sequence", "fractional-sequence.md");
+    for (const [seq, pos] of [[0, 0], [0.5, 10], [2, 20]]) {
+      s.insertEmbedding(
+        "fractional-sequence",
+        seq,
+        pos,
+        new Float32Array([1, 2, 3]),
+        MODEL,
+        now,
+        3,
+        fingerprint,
+      );
+    }
+
+    expect(s.getHashesNeedingEmbedding(MODEL)).toBe(0);
+    expect(inspectStore(s)).toMatchObject({
+      needsEmbedding: 0,
+      inconsistentChunkLayouts: 1,
+      requiredPartitionRows: 3,
+      missingRequiredPartitionRows: 0,
+      inconsistentPeerRows: 0,
+      structurallyReady: false,
+    });
+  });
+
+  test("reports a null total_chunks layout as inconsistent", async () => {
+    const s = await openStore();
+    s.ensureVecTable(3);
+    seedDocument(s, "docs", "null-total", "null-total.md");
+    seedPartitionVector(s, "docs", "null-total");
 
     // Rebuild this temp fixture with the same production columns and a
     // nullable total_chunks so the inspection can diagnose stored corruption
@@ -305,7 +336,7 @@ describe("inspectVectorIndex", () => {
     `);
 
     expect(s.getHashesNeedingEmbedding(MODEL)).toBe(0);
-    expect(inspect(s)).toMatchObject({
+    expect(inspectStore(s)).toMatchObject({
       needsEmbedding: 0,
       inconsistentChunkLayouts: 1,
       requiredPartitionRows: 1,
@@ -315,7 +346,7 @@ describe("inspectVectorIndex", () => {
     });
   });
 
-  test("rejects invalid recorded chunk positions missed by ordinary health", async () => {
+  test("reports invalid recorded chunk positions as inconsistent", async () => {
     const s = await openStore();
     s.ensureVecTable(3);
     const now = new Date().toISOString();
@@ -328,16 +359,16 @@ describe("inspectVectorIndex", () => {
       { hash: "nonzero-start", pos: 5 },
     ];
     for (const { hash, pos } of malformedStarts) {
-      insertDoc(s, "docs", hash, `${hash}.md`);
+      seedDocument(s, "docs", hash, `${hash}.md`);
       s.insertEmbedding(hash, 0, pos, new Float32Array([1, 2, 3]), MODEL, now, 1, fingerprint);
     }
 
-    insertDoc(s, "docs", "nonmonotone-pos", "nonmonotone-pos.md");
+    seedDocument(s, "docs", "nonmonotone-pos", "nonmonotone-pos.md");
     s.insertEmbedding("nonmonotone-pos", 0, 0, new Float32Array([1, 2, 3]), MODEL, now, 2, fingerprint);
     s.insertEmbedding("nonmonotone-pos", 1, 0, new Float32Array([1, 2, 3]), MODEL, now, 2, fingerprint);
 
     expect(s.getHashesNeedingEmbedding(MODEL)).toBe(0);
-    expect(inspect(s)).toMatchObject({
+    expect(inspectStore(s)).toMatchObject({
       needsEmbedding: 0,
       inconsistentChunkLayouts: 5,
       requiredPartitionRows: 6,
@@ -347,16 +378,16 @@ describe("inspectVectorIndex", () => {
     });
   });
 
-  test("counts a malformed mapping collection id instead of throwing", async () => {
+  test("reports a malformed mapping collection id as an inconsistent peer", async () => {
     const s = await openStore();
     s.ensureVecTable(3);
-    insertDoc(s, "docs", "malformed-map", "malformed-map.md");
-    insertVector(s, "docs", "malformed-map");
-    const row = mappedRow(s, "malformed-map");
+    seedDocument(s, "docs", "malformed-map", "malformed-map.md");
+    seedPartitionVector(s, "docs", "malformed-map");
+    const row = requireVectorMapping(s, "malformed-map");
     s.db.prepare(`UPDATE ${VEC_ROWS_TABLE} SET collection_id = ? WHERE id = ?`)
       .run("oops", row.rowid);
 
-    expect(inspect(s)).toMatchObject({
+    expect(inspectStore(s)).toMatchObject({
       requiredPartitionRows: 1,
       missingRequiredPartitionRows: 1,
       inconsistentPeerRows: 1,
@@ -368,15 +399,15 @@ describe("inspectVectorIndex", () => {
     const s = await openStore();
     s.ensureVecTable(3);
     for (const hash of ["map-only", "partition-mismatch", "healthy"]) {
-      insertDoc(s, "docs", hash, `${hash}.md`);
-      insertVector(s, "docs", hash);
+      seedDocument(s, "docs", hash, `${hash}.md`);
+      seedPartitionVector(s, "docs", hash);
     }
     const otherCollectionId = allocateCollectionId(s.db, "other");
 
-    const mapOnly = mappedRow(s, "map-only");
+    const mapOnly = requireVectorMapping(s, "map-only");
     s.db.prepare(`DELETE FROM ${VEC_TABLE} WHERE rowid = ?`).run(vecInteger(mapOnly.rowid));
 
-    const mismatch = mappedRow(s, "partition-mismatch");
+    const mismatch = requireVectorMapping(s, "partition-mismatch");
     s.db.prepare(`DELETE FROM ${VEC_TABLE} WHERE rowid = ?`).run(vecInteger(mismatch.rowid));
     s.db.prepare(`INSERT INTO ${VEC_TABLE} (rowid, collection_id, embedding) VALUES (?, ?, ?)`)
       .run(vecInteger(mismatch.rowid), vecInteger(otherCollectionId), new Float32Array([1, 2, 3]));
@@ -385,7 +416,7 @@ describe("inspectVectorIndex", () => {
     s.db.prepare(`INSERT INTO ${VEC_TABLE} (rowid, collection_id, embedding) VALUES (?, ?, ?)`)
       .run(vecInteger(vecOnlyRowid), vecInteger(otherCollectionId), new Float32Array([1, 2, 3]));
 
-    expect(inspect(s)).toMatchObject({
+    expect(inspectStore(s)).toMatchObject({
       partitionState: "checked",
       needsEmbedding: 0,
       inconsistentChunkLayouts: 0,
@@ -399,20 +430,20 @@ describe("inspectVectorIndex", () => {
   test("ordinary embedding copies a missing collection partition", async () => {
     const s = await openStore();
     s.ensureVecTable(3);
-    insertDoc(s, "first", "shared-hash", "shared.md");
-    insertVector(s, "first", "shared-hash");
-    insertDoc(s, "second", "shared-hash", "shared.md");
-    s.llm = new FakeLlm();
+    seedDocument(s, "first", "shared-hash", "shared.md");
+    seedPartitionVector(s, "first", "shared-hash");
+    seedDocument(s, "second", "shared-hash", "shared.md");
+    s.llm = new FixedEmbeddingLlm();
 
-    expect(inspect(s)).toMatchObject({
+    expect(inspectStore(s)).toMatchObject({
       missingRequiredPartitionRows: 1,
       inconsistentPeerRows: 0,
       structurallyReady: false,
     });
 
-    const embedded = await generateEmbeddings(s, { model: MODEL });
-    expect(embedded).toMatchObject({ chunksCopied: 1, chunksEmbedded: 0, errors: 0 });
-    expect(inspect(s)).toMatchObject({
+    const result = await generateEmbeddings(s, { model: MODEL });
+    expect(result).toMatchObject({ chunksCopied: 1, chunksEmbedded: 0, errors: 0 });
+    expect(inspectStore(s)).toMatchObject({
       missingRequiredPartitionRows: 0,
       inconsistentPeerRows: 0,
       structurallyReady: true,
@@ -422,21 +453,21 @@ describe("inspectVectorIndex", () => {
   test("whole-index forced embedding rebuilds peer corruption", async () => {
     const s = await openStore();
     s.ensureVecTable(3);
-    insertDoc(s, "docs", "corrupt-hash", "corrupt.md");
-    insertVector(s, "docs", "corrupt-hash");
-    const row = mappedRow(s, "corrupt-hash");
+    seedDocument(s, "docs", "corrupt-hash", "corrupt.md");
+    seedPartitionVector(s, "docs", "corrupt-hash");
+    const row = requireVectorMapping(s, "corrupt-hash");
     s.db.prepare(`DELETE FROM ${VEC_TABLE} WHERE rowid = ?`).run(vecInteger(row.rowid));
-    s.llm = new FakeLlm();
+    s.llm = new FixedEmbeddingLlm();
 
-    expect(inspect(s)).toMatchObject({
+    expect(inspectStore(s)).toMatchObject({
       missingRequiredPartitionRows: 1,
       inconsistentPeerRows: 1,
       structurallyReady: false,
     });
 
-    const embedded = await generateEmbeddings(s, { model: MODEL, force: true });
-    expect(embedded).toMatchObject({ chunksEmbedded: 1, errors: 0 });
-    expect(inspect(s)).toMatchObject({
+    const result = await generateEmbeddings(s, { model: MODEL, force: true });
+    expect(result).toMatchObject({ chunksEmbedded: 1, errors: 0 });
+    expect(inspectStore(s)).toMatchObject({
       missingRequiredPartitionRows: 0,
       inconsistentPeerRows: 0,
       structurallyReady: true,

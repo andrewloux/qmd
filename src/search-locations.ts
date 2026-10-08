@@ -1,3 +1,6 @@
+import type { RerankTokenBudget } from "./llm.js";
+import { containsCjk, parseLexicalQuery } from "./lexical-query.js";
+
 export type DocumentLocationRef = {
   uri: string;
   contentHash: string;
@@ -63,30 +66,15 @@ export type LocatedLexicalPassage = {
   passage: PassageWindow;
 };
 
-type BodyToken = Utf16Span & {
+type ApproximateBodyToken = Utf16Span & {
   comparable: string;
 };
 
-const FTS5_SEPARATOR_RUN = /[^\p{L}\p{N}'_]+/u;
-const CJK_CHAR_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const WORD_CHAR_PATTERN = /[\p{L}\p{N}]/u;
-const UTF8_ENCODER = new TextEncoder();
-
-function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}'_]/gu, "").toLowerCase();
-}
-
-function splitFTS5CompoundTerm(term: string): string[] {
-  return term.split(FTS5_SEPARATOR_RUN).map(sanitizeFTS5Term).filter(Boolean);
-}
-
-function containsCjk(text: string): boolean {
-  return CJK_CHAR_PATTERN.test(text);
-}
 
 function tokensForPhrase(phrase: string): string[] {
   const tokens: string[] = [];
-  for (const token of tokenizeText(phrase)) {
+  for (const token of tokenizeApproximateBody(phrase)) {
     tokens.push(token.comparable);
   }
   return tokens;
@@ -95,57 +83,17 @@ function tokensForPhrase(phrase: string): string[] {
 /** Parse the positive anchors accepted by QMD's lexical query grammar. */
 export function parsePositiveLexicalAnchors(query: string): PositiveLexicalAnchor[] {
   const anchors: PositiveLexicalAnchor[] = [];
-  const source = query.trim();
-  let index = 0;
-
-  while (index < source.length) {
-    while (index < source.length && /\s/.test(source[index]!)) index++;
-    if (index >= source.length) break;
-
-    const negated = source[index] === "-";
-    if (negated) index++;
-
-    if (source[index] === '"') {
-      const start = ++index;
-      while (index < source.length && source[index] !== '"') index++;
-      const phrase = source.slice(start, index).trim();
-      if (index < source.length) index++;
-
-      if (!negated && phrase.length > 0) {
-        const tokens = tokensForPhrase(phrase);
-        if (tokens.length > 0) {
-          anchors.push({ kind: "phrase", text: phrase, tokens, match: "phrase" });
-        }
-      }
-      continue;
-    }
-
-    const start = index;
-    while (index < source.length && !/[\s"]/.test(source[index]!)) index++;
-    const term = source.slice(start, index);
-    if (negated || term.length === 0) continue;
-
-    if (containsCjk(term)) {
-      const tokens = tokensForPhrase(term);
-      if (tokens.length > 0) {
-        anchors.push({ kind: "phrase", text: term, tokens, match: "phrase" });
-      }
-      continue;
-    }
-
-    const parts = splitFTS5CompoundTerm(term);
-    if (parts.length === 0) continue;
-
-    const tokens = tokensForPhrase(term);
+  for (const clause of parseLexicalQuery(query)) {
+    if (clause.negated) continue;
+    const tokens = tokensForPhrase(clause.text);
     if (tokens.length === 0) continue;
-
-    if (parts.length > 1) {
-      anchors.push({ kind: "phrase", text: term, tokens, match: "phrase" });
-    } else {
-      anchors.push({ kind: "literal", text: term, tokens, match: "prefix" });
-    }
+    anchors.push({
+      kind: clause.match === "phrase" ? "phrase" : "literal",
+      text: clause.text,
+      tokens,
+      match: clause.match,
+    });
   }
-
   return anchors;
 }
 
@@ -156,22 +104,20 @@ export function boundedPassageWindow(
   budget: PassageBudget,
 ): PassageWindow {
   assertBodySpan(body, anchor, "anchor");
-  assertBudget(budget);
+  const validatedBudget = validatePassageBudget(budget);
 
-  const maxScalars = budget.maxUnicodeScalars ?? Number.POSITIVE_INFINITY;
-  const anchorText = body.slice(anchor.startUtf16, anchor.endUtf16);
-  const anchorBytes = utf8Bytes(anchorText);
-  const anchorScalars = unicodeScalars(anchorText);
+  const maxScalars = validatedBudget.maxUnicodeScalars ?? Number.POSITIVE_INFINITY;
+  const anchorSize = measureScalarRange(body, anchor.startUtf16, anchor.endUtf16);
 
-  if (anchorBytes > budget.maxUtf8Bytes || anchorScalars > maxScalars) {
+  if (anchorSize.utf8Bytes > validatedBudget.maxUtf8Bytes || anchorSize.unicodeScalars > maxScalars) {
     let endUtf16 = anchor.startUtf16;
     let bytes = 0;
     let scalars = 0;
 
     while (endUtf16 < anchor.endUtf16) {
       const nextEnd = nextScalarEnd(body, endUtf16);
-      const scalarBytes = utf8Bytes(body.slice(endUtf16, nextEnd));
-      if (bytes + scalarBytes > budget.maxUtf8Bytes || scalars + 1 > maxScalars) break;
+      const scalarBytes = scalarByteWidth(body.codePointAt(endUtf16)!);
+      if (bytes + scalarBytes > validatedBudget.maxUtf8Bytes || scalars + 1 > maxScalars) break;
       bytes += scalarBytes;
       scalars++;
       endUtf16 = nextEnd;
@@ -189,22 +135,23 @@ export function boundedPassageWindow(
 
   let startUtf16 = anchor.startUtf16;
   let endUtf16 = anchor.endUtf16;
-  let bytes = anchorBytes;
-  let scalars = anchorScalars;
+  let bytes = anchorSize.utf8Bytes;
+  let scalars = anchorSize.unicodeScalars;
   let nextSide: "left" | "right" = "left";
   let leftOpen = startUtf16 > 0;
   let rightOpen = endUtf16 < body.length;
 
   while (leftOpen || rightOpen) {
     let added = false;
-    const sides: readonly ("left" | "right")[] =
-      nextSide === "left" ? ["left", "right"] : ["right", "left"];
+    const preferredSide = nextSide;
+    const alternateSide = preferredSide === "left" ? "right" : "left";
 
-    for (const side of sides) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const side = attempt === 0 ? preferredSide : alternateSide;
       if (side === "left" && leftOpen) {
         const nextStart = previousScalarStart(body, startUtf16);
-        const scalarBytes = utf8Bytes(body.slice(nextStart, startUtf16));
-        if (bytes + scalarBytes <= budget.maxUtf8Bytes && scalars + 1 <= maxScalars) {
+        const scalarBytes = scalarByteWidth(body.codePointAt(nextStart)!);
+        if (bytes + scalarBytes <= validatedBudget.maxUtf8Bytes && scalars + 1 <= maxScalars) {
           startUtf16 = nextStart;
           bytes += scalarBytes;
           scalars++;
@@ -218,8 +165,8 @@ export function boundedPassageWindow(
 
       if (side === "right" && rightOpen) {
         const nextEnd = nextScalarEnd(body, endUtf16);
-        const scalarBytes = utf8Bytes(body.slice(endUtf16, nextEnd));
-        if (bytes + scalarBytes <= budget.maxUtf8Bytes && scalars + 1 <= maxScalars) {
+        const scalarBytes = scalarByteWidth(body.codePointAt(endUtf16)!);
+        if (bytes + scalarBytes <= validatedBudget.maxUtf8Bytes && scalars + 1 <= maxScalars) {
           endUtf16 = nextEnd;
           bytes += scalarBytes;
           scalars++;
@@ -232,7 +179,7 @@ export function boundedPassageWindow(
       }
     }
 
-    if (!added && !leftOpen && !rightOpen) break;
+    if (!added) break;
   }
 
   return {
@@ -245,7 +192,71 @@ export function boundedPassageWindow(
   };
 }
 
-/** Locate the first strongest positive lexical anchor in the document body. */
+/** Fit a scalar-safe source passage within both caller and reranker limits. */
+export function fitPassageWindow(
+  body: string,
+  anchor: Utf16Span,
+  budget: PassageBudget,
+  rerankBudget: RerankTokenBudget,
+): PassageWindow {
+  assertBodySpan(body, anchor, "anchor");
+  const validatedBudget = validatePassageBudget(budget);
+  assertOffset(rerankBudget.maxDocumentTokens, "maxDocumentTokens");
+
+  const requestedPassage = boundedPassageWindow(body, anchor, validatedBudget);
+  if (passageFitsReranker(requestedPassage, rerankBudget)) return requestedPassage;
+
+  const emptyPassage = boundedPassageWindow(body, anchor, {
+    ...validatedBudget,
+    maxUtf8Bytes: 0,
+    maxUnicodeScalars: 0,
+  });
+  if (!passageFitsReranker(emptyPassage, rerankBudget)) {
+    throw new RangeError("rerank token budget must fit an empty passage");
+  }
+
+  let bestFit = emptyPassage;
+  let minimumByteLimit = 1;
+  let maximumByteLimit = requestedPassage.utf8Bytes - 1;
+  const anchorSize = measureScalarRange(body, anchor.startUtf16, anchor.endUtf16);
+  const callerBudgetFitsAnchor =
+    anchorSize.utf8Bytes <= validatedBudget.maxUtf8Bytes
+    && anchorSize.unicodeScalars <= (validatedBudget.maxUnicodeScalars ?? Number.POSITIVE_INFINITY);
+
+  if (callerBudgetFitsAnchor) {
+    const anchorPassage = boundedPassageWindow(body, anchor, {
+      ...validatedBudget,
+      maxUtf8Bytes: anchorSize.utf8Bytes,
+      maxUnicodeScalars: anchorSize.unicodeScalars,
+    });
+    if (passageFitsReranker(anchorPassage, rerankBudget)) {
+      bestFit = anchorPassage;
+      minimumByteLimit = anchorPassage.utf8Bytes + 1;
+    }
+  }
+
+  while (minimumByteLimit <= maximumByteLimit) {
+    const maxUtf8Bytes = minimumByteLimit
+      + Math.floor((maximumByteLimit - minimumByteLimit) / 2);
+    const candidatePassage = boundedPassageWindow(body, anchor, {
+      ...validatedBudget,
+      maxUtf8Bytes,
+    });
+
+    if (passageFitsReranker(candidatePassage, rerankBudget)) {
+      bestFit = candidatePassage;
+      minimumByteLimit = maxUtf8Bytes + 1;
+    } else {
+      maximumByteLimit = maxUtf8Bytes - 1;
+    }
+  }
+
+  if (passageFitsReranker(bestFit, rerankBudget)) return bestFit;
+  if (passageFitsReranker(emptyPassage, rerankBudget)) return emptyPassage;
+  throw new RangeError("rerank token budget changed while fitting the passage");
+}
+
+/** Locate the first strongest positive lexical anchor and bound its surrounding passage. */
 export function locateLexical(
   body: string,
   query: string,
@@ -253,41 +264,47 @@ export function locateLexical(
   budget: PassageBudget,
 ): LocatedLexicalPassage | null {
   assertDocumentRef(ref);
-  assertBudget(budget);
+  const validatedBudget = validatePassageBudget(budget);
+  const location = findLexicalLocation(body, query, ref);
+  if (!location) return null;
+  return {
+    location,
+    passage: boundedPassageWindow(body, location, validatedBudget),
+  };
+}
 
+/** Locate the first strongest positive lexical anchor in the document body. */
+export function findLexicalLocation(
+  body: string,
+  query: string,
+  ref: DocumentLocationRef,
+): LexicalLocation | null {
+  assertDocumentRef(ref);
   const anchors = parsePositiveLexicalAnchors(query);
   for (const anchor of anchors) {
     const span = findExactAnchor(body, anchor);
     if (!span) continue;
 
-    const passage = boundedPassageWindow(body, span, budget);
     return {
-      location: {
-        ...ref,
-        ...span,
-        kind: "lexical_exact",
-        anchorKind: anchor.kind,
-        matchedText: body.slice(span.startUtf16, span.endUtf16),
-      },
-      passage,
+      ...ref,
+      ...span,
+      kind: "lexical_exact",
+      anchorKind: anchor.kind,
+      matchedText: body.slice(span.startUtf16, span.endUtf16),
     };
   }
 
-  const bodyTokens = tokenizeText(body);
+  const bodyTokens = tokenizeApproximateBody(body);
   for (const anchor of anchors) {
     const span = findApproximateAnchor(bodyTokens, anchor);
     if (!span) continue;
 
-    const passage = boundedPassageWindow(body, span, budget);
     return {
-      location: {
-        ...ref,
-        ...span,
-        kind: "lexical_approximate",
-        reason: "stem_or_tokenizer",
-        queryText: anchor.text,
-      },
-      passage,
+      ...ref,
+      ...span,
+      kind: "lexical_approximate",
+      reason: "stem_or_tokenizer",
+      queryText: anchor.text,
     };
   }
 
@@ -335,7 +352,7 @@ function findExactAnchor(body: string, anchor: PositiveLexicalAnchor): Utf16Span
 }
 
 function findApproximateAnchor(
-  bodyTokens: readonly BodyToken[],
+  bodyTokens: readonly ApproximateBodyToken[],
   anchor: PositiveLexicalAnchor,
 ): Utf16Span | null {
   if (anchor.tokens.length === 0) return null;
@@ -343,7 +360,7 @@ function findApproximateAnchor(
   for (let bodyIndex = 0; bodyIndex + anchor.tokens.length <= bodyTokens.length; bodyIndex++) {
     let matches = true;
     for (let queryIndex = 0; queryIndex < anchor.tokens.length; queryIndex++) {
-      const queryToken = comparableToken(anchor.tokens[queryIndex]!);
+      const queryToken = anchor.tokens[queryIndex]!;
       const bodyToken = bodyTokens[bodyIndex + queryIndex]!;
       const prefixAllowed = anchor.match === "prefix" && queryIndex === anchor.tokens.length - 1;
       if (!tokensApproximate(queryToken, bodyToken.comparable, prefixAllowed)) {
@@ -366,10 +383,10 @@ function findApproximateAnchor(
 function tokensApproximate(query: string, body: string, prefixAllowed: boolean): boolean {
   if (query === body) return true;
   if (prefixAllowed && body.startsWith(query)) return true;
-  return porterComparableStem(query) === porterComparableStem(body);
+  return approximateStem(query) === approximateStem(body);
 }
 
-function porterComparableStem(token: string): string {
+function approximateStem(token: string): string {
   let stem = token;
   if (stem.length < 3) return stem;
 
@@ -392,8 +409,8 @@ function porterComparableStem(token: string): string {
   return stem;
 }
 
-function tokenizeText(text: string): BodyToken[] {
-  const tokens: BodyToken[] = [];
+function tokenizeApproximateBody(text: string): ApproximateBodyToken[] {
+  const tokens: ApproximateBodyToken[] = [];
   let tokenStart: number | null = null;
   let index = 0;
 
@@ -467,19 +484,42 @@ function nextScalarEnd(text: string, offset: number): number {
   return offset + 1;
 }
 
-function isScalarBoundary(text: string, offset: number): boolean {
-  if (offset <= 0 || offset >= text.length) return true;
+/** Return whether an in-range UTF-16 offset falls between complete scalar values. */
+export function isUtf16Boundary(text: string, offset: number): boolean {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > text.length) return false;
+  if (offset === 0 || offset === text.length) return true;
   const previous = text.charCodeAt(offset - 1);
   const next = text.charCodeAt(offset);
   return !(previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff);
 }
 
-function utf8Bytes(text: string): number {
-  return UTF8_ENCODER.encode(text).byteLength;
+function scalarByteWidth(codePoint: number): number {
+  if (codePoint <= 0x7f) return 1;
+  if (codePoint <= 0x7ff) return 2;
+  if (codePoint <= 0xffff) return 3;
+  return 4;
 }
 
-function unicodeScalars(text: string): number {
-  return Array.from(text).length;
+function measureScalarRange(body: string, startUtf16: number, endUtf16: number): {
+  utf8Bytes: number;
+  unicodeScalars: number;
+} {
+  let utf8Bytes = 0;
+  let unicodeScalars = 0;
+  for (let offset = startUtf16; offset < endUtf16; offset = nextScalarEnd(body, offset)) {
+    utf8Bytes += scalarByteWidth(body.codePointAt(offset)!);
+    unicodeScalars++;
+  }
+  return { utf8Bytes, unicodeScalars };
+}
+
+function passageFitsReranker(
+  passage: PassageWindow,
+  rerankBudget: RerankTokenBudget,
+): boolean {
+  const tokens = rerankBudget.countTokens(passage.text);
+  assertOffset(tokens, "countTokens result");
+  return tokens <= rerankBudget.maxDocumentTokens;
 }
 
 function assertDocumentRef(ref: DocumentLocationRef): void {
@@ -508,14 +548,21 @@ function assertBodySpan(body: string, span: Utf16Span, name: string): void {
   if (span.endUtf16 > body.length) {
     throw new RangeError(`${name}.endUtf16 must be within the body`);
   }
-  if (!isScalarBoundary(body, span.startUtf16) || !isScalarBoundary(body, span.endUtf16)) {
+  if (!isUtf16Boundary(body, span.startUtf16) || !isUtf16Boundary(body, span.endUtf16)) {
     throw new RangeError(`${name} boundaries must preserve Unicode scalar values`);
   }
 }
 
-function assertBudget(budget: PassageBudget): void {
-  assertOffset(budget.maxUtf8Bytes, "maxUtf8Bytes");
-  if (budget.maxUnicodeScalars !== undefined) {
-    assertOffset(budget.maxUnicodeScalars, "maxUnicodeScalars");
+/** Validate a passage budget and return an independent numeric copy. */
+export function validatePassageBudget(budget: PassageBudget): PassageBudget {
+  const { maxUtf8Bytes, maxUnicodeScalars } = budget;
+  assertOffset(maxUtf8Bytes, "maxUtf8Bytes");
+  if (maxUnicodeScalars !== undefined) {
+    assertOffset(maxUnicodeScalars, "maxUnicodeScalars");
+    return {
+      maxUtf8Bytes,
+      maxUnicodeScalars,
+    };
   }
+  return { maxUtf8Bytes };
 }
