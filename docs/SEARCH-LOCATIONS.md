@@ -8,8 +8,8 @@ returns the bounded text even when `locations` is omitted.
 
 ## One Orbit passage through retrieval and reading
 
-An Orbit document begins with `9,001` emoji and stores its nearest vector
-chunk at UTF-16 offset `18,002`. The application retrieves that component:
+A synthetic Orbit document begins with `9,001` emoji and stores its nearest
+vector chunk at UTF-16 offset `18,002`. The application retrieves that component:
 
 ```typescript
 const response = await store.searchCandidates({

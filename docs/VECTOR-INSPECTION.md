@@ -8,8 +8,8 @@ existing cheap scan and three-field result.
 
 ## One missing partition through inspection and repair
 
-An Orbit document already has embeddings in collection `docs`. The same
-content hash becomes active in collection `notes`. Its recorded chunks are
+A synthetic Orbit document already has embeddings in collection `docs`.
+The same content hash becomes active in collection `notes`. Its recorded chunks are
 complete, so the ordinary pending-embedding count remains `0`. The new
 collection needs a partition row for every stored chunk:
 
@@ -79,11 +79,10 @@ verifies source/projection provenance. Structural readiness proves recorded
 coverage and physical consistency. Semantic vector/content correctness needs
 its own provenance and retrieval checks.
 
-The source adapter separately verifies each recorded position against the
-immutable projection revision: the full hash must match, the start must lie
-within the source body, and the start must preserve a Unicode-scalar boundary.
-Deep inspection checks the stored position layout using SQL and leaves source
-body hydration to that separate publication check.
+Callers verify source positions against the document's recorded full hash.
+Each start must lie within that source body and preserve a Unicode-scalar
+boundary. Deep inspection checks the stored position layout using SQL;
+callers read source bodies to perform the content and boundary checks.
 
 ## Existing repair paths
 

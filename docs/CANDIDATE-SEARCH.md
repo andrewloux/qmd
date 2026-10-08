@@ -7,7 +7,7 @@ options, ranking, and result shapes.
 
 ## One request through the pipeline
 
-An application stores multiple Orbit passages with `component: "orbit"` in
+An application stores synthetic Orbit passages with `component: "orbit"` in
 `qmd.metadata`. Twenty strong documents belong to two components. Eight
 additional documents belong to eight different components. The application
 asks for ten components:
