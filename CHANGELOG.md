@@ -4,6 +4,11 @@
 
 ### Added
 
+- SDK `inspectVectorIndex()` checks selected model/fingerprint chunk layouts,
+  required active collection partitions, and both directions of physical
+  map/vector integrity in one SQLite snapshot. It reports structural readiness
+  and explicit corruption counts, preserves coherent inactive vector caches,
+  and leaves the existing cheap health call and repair paths intact.
 - SDK candidate search accepts configurable passage budgets and opt-in source
   locations. Results distinguish exact/approximate lexical anchors, stored
   vector starts, and keyword/intent selection windows; every location carries
