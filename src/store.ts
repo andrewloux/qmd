@@ -1624,8 +1624,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -2657,8 +2657,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => searchFTS(db, query, limit, collectionName, filter),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter),
+    searchFTS: (query, limit, collectionName, filter, retrieval) => searchFTS(db, query, limit, collectionName, filter, retrieval),
+    searchVec: (query, model, limit, collectionName, session, precomputedEmbedding, filter, retrieval) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter, retrieval),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
@@ -4707,7 +4707,22 @@ function compareFilepaths(a: { filepath: string }, b: { filepath: string }): num
   return a.filepath < b.filepath ? -1 : a.filepath > b.filepath ? 1 : 0;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
+export type VectorScanCoverage = {
+  collectionId: number | null;
+  requestedK: number;
+  matchedChunks: number;
+  resolvedDocuments: number;
+  backendCapReached: boolean;
+};
+
+export type SearchRetrievalOptions = {
+  /** Compact retrieval defers document bodies until candidate admission. */
+  includeBody?: boolean;
+  /** Reports the final KNN scan of each collection target. */
+  onVectorScan?: (coverage: VectorScanCoverage) => void;
+};
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
 
   const ftsQuery = buildFTS5Query(query);
@@ -4743,7 +4758,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      ${cappedBodySql("content.doc")} as body,
+      ${retrieval?.includeBody === false ? "''" : cappedBodySql("content.doc")} as body,
+      ${retrieval?.includeBody === false ? "length(CAST(content.doc AS BLOB)) as body_length," : ""}
       d.hash,
       fm.bm25_score,
       dm.metadata_json
@@ -4772,7 +4788,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY fm.bm25_score ASC, filepath ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number; metadata_json: string | null }[];
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; body_length: number; hash: string; bm25_score: number; metadata_json: string | null }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
@@ -4788,8 +4804,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       docid: getDocid(row.hash),
       collectionName,
       modifiedAt: "",  // Not available in FTS query
-      bodyLength: row.body.length,
-      body: row.body,
+      bodyLength: retrieval?.includeBody === false ? row.body_length : row.body.length,
+      ...(retrieval?.includeBody === false ? {} : { body: row.body }),
       context: getContextForFile(db, row.filepath),
       metadata: parseMetadataJson(row.metadata_json),
       score,
@@ -4964,16 +4980,26 @@ function nearestVecDocuments(
   queryVec: Float32Array,
   limit: number,
   target: VecScanTarget,
+  onScan?: (coverage: VectorScanCoverage) => void,
 ): VecDocumentMatch[] {
   for (let k = limit * 3; ; k *= 2) {
     const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
     const matches = scan(queryVec, vecK, target);
     const documents = resolve(matches);
-    if (documents.length >= limit || matches.length < vecK || vecK === SQLITE_VEC_MAX_K) return documents;
+    if (documents.length >= limit || matches.length < vecK || vecK === SQLITE_VEC_MAX_K) {
+      onScan?.({
+        collectionId: target.collectionId ?? null,
+        requestedK: vecK,
+        matchedChunks: matches.length,
+        resolvedDocuments: documents.length,
+        backendCapReached: vecK === SQLITE_VEC_MAX_K && matches.length === vecK,
+      });
+      return documents;
+    }
   }
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
@@ -5005,19 +5031,21 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const queryVec = new Float32Array(embedding);
   // Bodies are capped at BODY_CAP_CHARS, as in searchFTS, so a large document cannot
   // put its whole text on the heap for each result.
-  const bodyOf = db.prepare(`SELECT ${cappedBodySql("doc")} AS doc FROM content WHERE hash = ?`);
+  const bodyOf = db.prepare(retrieval?.includeBody === false
+    ? "SELECT '' AS doc, length(CAST(doc AS BLOB)) AS body_length FROM content WHERE hash = ?"
+    : `SELECT ${cappedBodySql("doc")} AS doc FROM content WHERE hash = ?`);
 
   // Each target yields its own nearest `limit` documents (or all it holds), so
   // merging them by distance gives the scope's exact nearest `limit`. Ties go
   // to the smaller filepath, as in searchFTS.
   return scanTargets
-    .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target))
+    .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target, retrieval?.onVectorScan))
     .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
     .slice(0, limit)
     .flatMap((row): SearchResult[] => {
       // The body is read after resolution, outside its snapshot: another
       // process's orphaned-content cleanup can delete the row in between.
-      const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
+      const content = bodyOf.get(row.hash) as { doc: string; body_length: number } | null | undefined;
       if (content == null) return [];
       const body = content.doc;
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
@@ -5029,8 +5057,8 @@ export async function searchVec(db: Database, query: string, model: string, limi
         docid: getDocid(row.hash),
         collectionName,
         modifiedAt: "",  // Not available in vec query
-        bodyLength: body.length,
-        body,
+        bodyLength: retrieval?.includeBody === false ? content.body_length : body.length,
+        ...(retrieval?.includeBody === false ? {} : { body }),
         context: getContextForFile(db, row.filepath),
         metadata: parseMetadataJson(row.metadata_json),
         score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
