@@ -8,13 +8,15 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { existsSync, writeFileSync, mkdirSync, readFileSync, utimesSync } from "node:fs";
 import YAML from "yaml";
 import {
   createStore,
   type QMDStore,
   type CollectionConfig,
+  type DocumentMetadata,
+  type DocumentMetadataSource,
   type StoreOptions,
   type UpdateProgress,
   type SearchOptions,
@@ -855,6 +857,7 @@ describe("update", () => {
     expect(result.staleVectorsRemoved).toBe(0);
     expect(result.vectorsCopied).toBe(0);
     expect(typeof result.needsEmbedding).toBe("number");
+    expect(result.metadataErrors).toBe(0);
 
     await store.close();
   });
@@ -955,6 +958,286 @@ describe("update", () => {
     expect(results.length).toBeGreaterThan(0);
 
     await store.close();
+  });
+});
+
+describe("update with a metadata source", () => {
+  type SourceDocument = Parameters<DocumentMetadataSource>[0];
+  type MetadataState = { source: string; metadata_json: string; extraction_error: string | null; extracted_at: string };
+
+  // Older than the racy-sync window, so the stat fast path trusts these files.
+  const settledTime = new Date(Date.now() - 60 * 60 * 1000);
+
+  async function settledCollection(files: Record<string, string>): Promise<string> {
+    const dir = join(testDir, `metadata-source-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    for (const [path, content] of Object.entries(files)) {
+      const filePath = join(dir, path);
+      await mkdir(dirname(filePath), { recursive: true });
+      await writeFile(filePath, content);
+      utimesSync(filePath, settledTime, settledTime);
+    }
+    return dir;
+  }
+
+  function storeOver(collections: Record<string, string>): Promise<QMDStore> {
+    return createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: Object.fromEntries(Object.entries(collections).map(([name, path]) => [name, { path, pattern: "**/*.md" }])),
+      },
+    });
+  }
+
+  function metadataState(store: QMDStore, path: string): MetadataState | undefined {
+    return store.internal.db.prepare(`
+      SELECT dm.source, dm.metadata_json, dm.extraction_error, dm.extracted_at
+      FROM documents d JOIN document_metadata dm ON dm.document_id = d.id
+      WHERE d.active = 1 AND d.path = ?
+    `).get(path) as MetadataState | undefined;
+  }
+
+  function documentHash(store: QMDStore, path: string): string | undefined {
+    const row = store.internal.db.prepare(`SELECT hash FROM documents WHERE active = 1 AND path = ?`).get(path) as { hash: string } | undefined;
+    return row?.hash;
+  }
+
+  /** A JavaScript caller's source, whose answer the TypeScript signature cannot check. */
+  function untypedSource(answer: (document: SourceDocument) => unknown): DocumentMetadataSource {
+    return answer as DocumentMetadataSource;
+  }
+
+  const waitForNewTimestamp = () => new Promise(resolve => setTimeout(resolve, 5));
+
+  test("one unchanged file moves from frontmatter to external, changed, empty, and back to frontmatter", async () => {
+    const dir = await settledCollection({
+      "note.md": "---\nqmd:\n  metadata:\n    author: human\n---\n\n# Note\n\nRetry twice.\n",
+    });
+    const store = await storeOver({ notes: dir });
+    const asked: SourceDocument[] = [];
+    const answer = (metadata: DocumentMetadata): DocumentMetadataSource => (document) => {
+      asked.push(document);
+      return metadata;
+    };
+    const assistant = { author: "assistant", provider: "anthropic" };
+
+    try {
+      expect(await store.update()).toMatchObject({ indexed: 1, metadataErrors: 0 });
+      expect(metadataState(store, "note.md")).toMatchObject({ source: "frontmatter", metadata_json: '{"author":"human"}', extraction_error: null });
+      const hash = documentHash(store, "note.md");
+
+      // The source replaces the native YAML claim, which stays searchable text.
+      await store.update({ metadata: answer(assistant) });
+      const external = metadataState(store, "note.md");
+      expect(external).toMatchObject({ source: "external", metadata_json: JSON.stringify(assistant), extraction_error: null });
+      expect(asked).toEqual([{ collection: "notes", path: "note.md", hash }]);
+      expect(await store.searchLex("retry", { filter: { field: "author", operator: "eq", value: "assistant" } })).toHaveLength(1);
+      expect(await store.searchLex("retry", { filter: { field: "author", operator: "eq", value: "human" } })).toEqual([]);
+      expect(await store.searchLex("human")).toHaveLength(1);
+      expect((await store.listMetadata()).keys.map(key => key.key)).toEqual(["author", "provider"]);
+
+      // The same answer keeps the row and its extraction time.
+      await waitForNewTimestamp();
+      await store.update({ metadata: answer({ ...assistant }) });
+      expect(metadataState(store, "note.md")).toEqual(external);
+
+      // A changed answer through the hash fast path: mtime moved, bytes did not.
+      const touched = new Date(settledTime.getTime() - 60_000);
+      utimesSync(join(dir, "note.md"), touched, touched);
+      expect(await store.update({ metadata: answer({ author: "human", reviewed: true }) }))
+        .toMatchObject({ unchanged: 1, updated: 0, metadataErrors: 0 });
+      expect(asked.at(-1)).toEqual({ collection: "notes", path: "note.md", hash });
+      expect(metadataState(store, "note.md")).toMatchObject({ source: "external", metadata_json: '{"author":"human","reviewed":true}' });
+
+      // An empty answer clears every key.
+      await store.update({ metadata: answer({}) });
+      expect(metadataState(store, "note.md")).toMatchObject({ source: "external", metadata_json: "{}", extraction_error: null });
+      expect(await store.searchLex("retry", { filter: { field: "author", operator: "exists", value: false } })).toHaveLength(1);
+
+      // A default update re-extracts the frontmatter and takes the row back.
+      expect(await store.update()).toMatchObject({ unchanged: 1, metadataErrors: 0 });
+      const frontmatter = metadataState(store, "note.md");
+      expect(frontmatter).toMatchObject({ source: "frontmatter", metadata_json: '{"author":"human"}', extraction_error: null });
+      await waitForNewTimestamp();
+      await store.update();
+      expect(metadataState(store, "note.md")).toEqual(frontmatter);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("asks once per admitted nonblank file with its path and indexed hash, reading no bytes on the stat fast path", async () => {
+    const dir = await settledCollection({
+      "a.md": "# A\n\nalpha body\n",
+      "sub/b.md": "# B\n\nbeta body\n",
+      "blank.md": " \n\t\n",
+    });
+    const store = await storeOver({ notes: dir });
+    const asked: SourceDocument[] = [];
+    const recordPath: DocumentMetadataSource = (document) => {
+      asked.push(document);
+      return { path: document.path };
+    };
+
+    try {
+      expect(await store.update({ metadata: recordPath })).toMatchObject({ indexed: 2, metadataErrors: 0 });
+      expect(asked.map(document => document.path).sort()).toEqual(["a.md", "sub/b.md"]);
+      for (const document of asked) {
+        expect(document).toEqual({ collection: "notes", path: document.path, hash: documentHash(store, document.path) });
+      }
+
+      // A same-size rewrite that keeps mtime passes the stat fast path, so QMD
+      // asks with the indexed hash and never sees the new bytes.
+      const indexedHash = documentHash(store, "a.md");
+      writeFileSync(join(dir, "a.md"), "# A\n\nALPHA BODY\n");
+      utimesSync(join(dir, "a.md"), settledTime, settledTime);
+      asked.length = 0;
+      expect(await store.update({ metadata: recordPath })).toMatchObject({ unchanged: 2, updated: 0 });
+      expect(asked.find(document => document.path === "a.md")?.hash).toBe(indexedHash);
+      expect(documentHash(store, "a.md")).toBe(indexedHash);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("invalid answers keep the scan going, sum across collections, and stay out of filtered search", async () => {
+    const notes = await settledCollection({
+      "valid.md": "# Valid\n\nshared term\n",
+      "then.md": "# Then\n\nshared term\n",
+      "missing.md": "# Missing\n\nshared term\n",
+    });
+    const archive = await settledCollection({
+      "map.md": "# Map\n\nshared term\n",
+      "huge.md": "# Huge\n\nshared term\n",
+    });
+    const answers: Record<string, unknown> = {
+      "valid.md": { status: "ok" },
+      "then.md": { then: "x" },
+      "missing.md": undefined,
+      "map.md": new Map([["status", "ok"]]),
+      "huge.md": { notes: Array.from({ length: 128 }, (_, index) => String(index).padEnd(1024, "x")) },
+    };
+    const answerByPath = untypedSource(document => answers[document.path]);
+    const store = await storeOver({ notes, archive });
+
+    try {
+      expect(await store.update({ metadata: answerByPath })).toMatchObject({ indexed: 5, metadataErrors: 3 });
+      for (const path of ["missing.md", "map.md", "huge.md"]) {
+        expect({ path, state: metadataState(store, path) }).toEqual({
+          path,
+          state: expect.objectContaining({ source: "external", metadata_json: "{}", extraction_error: expect.stringMatching(/^metadata source: /) }),
+        });
+      }
+      expect(metadataState(store, "then.md")).toMatchObject({ metadata_json: '{"then":"x"}', extraction_error: null });
+
+      expect(await store.searchLex("shared", { limit: 10 })).toHaveLength(5);
+      const withoutStatus = await store.searchLex("shared", { limit: 10, filter: { field: "status", operator: "exists", value: false } });
+      expect(withoutStatus.map(result => result.displayPath)).toEqual(["notes/then.md"]);
+      expect((await store.getStatus()).pendingMetadata).toBe(3);
+
+      // Every update asks again, so unchanged invalid answers count again.
+      expect((await store.update({ metadata: answerByPath })).metadataErrors).toBe(3);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("a throwing source rejects with collection, path and cause, keeping only committed batches", async () => {
+    const dir = await settledCollection(Object.fromEntries(
+      Array.from({ length: 501 }, (_, index) => [`f${String(index).padStart(3, "0")}.md`, `# File ${index}\n\nbody ${index}\n`]),
+    ));
+    const store = await storeOver({ notes: dir });
+    const asked: string[] = [];
+    const failure = new Error("source map has no row");
+    // 500 files fill a scan batch at most, so the 501st ask runs after at least one commit.
+    const failOn501st: DocumentMetadataSource = (document) => {
+      asked.push(document.path);
+      if (asked.length === 501) throw failure;
+      return { position: asked.length };
+    };
+
+    try {
+      const error = await store.update({ metadata: failOn501st }).then(() => undefined, (err: unknown) => err);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(`Metadata source failed for notes/${asked[500]}: source map has no row`);
+      expect((error as Error).cause).toBe(failure);
+
+      // Committed batches hold a prefix of the ask order, each with its whole external answer.
+      const rows = store.internal.db.prepare(`
+        SELECT d.path, dm.source, dm.metadata_json, dm.extraction_error
+        FROM documents d LEFT JOIN document_metadata dm ON dm.document_id = d.id
+        WHERE d.active = 1
+      `).all() as { path: string; source: string | null; metadata_json: string | null; extraction_error: string | null }[];
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.length).toBeLessThan(501);
+      expect(new Set(rows.map(row => row.path))).toEqual(new Set(asked.slice(0, rows.length)));
+      for (const row of rows) {
+        expect(row).toEqual({
+          path: row.path,
+          source: "external",
+          metadata_json: JSON.stringify({ position: asked.indexOf(row.path) + 1 }),
+          extraction_error: null,
+        });
+      }
+
+      const completed = await store.update({ metadata: () => ({ position: 0 }) });
+      expect(completed).toMatchObject({ indexed: 501 - rows.length, unchanged: rows.length, metadataErrors: 0 });
+      expect((await store.getStatus()).pendingMetadata).toBe(0);
+    } finally {
+      await store.close();
+    }
+  }, 60_000);
+
+  test("a thenable answer rejects the update and its abandoned promise stays handled", async () => {
+    const dir = await settledCollection({ "a.md": "# A\n\nalpha\n" });
+    const store = await storeOver({ notes: dir });
+    const unhandled: unknown[] = [];
+    const recordUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", recordUnhandled);
+
+    try {
+      await expect(store.update({ metadata: untypedSource(async () => ({ status: "ok" })) })).rejects.toThrow(
+        "Metadata source returned a thenable for notes/a.md. DocumentMetadataSource must return metadata synchronously.",
+      );
+      await expect(store.update({ metadata: untypedSource(() => Promise.reject(new Error("late rejection"))) })).rejects.toThrow(TypeError);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+      expect(documentHash(store, "a.md")).toBeUndefined();
+    } finally {
+      process.off("unhandledRejection", recordUnhandled);
+      await store.close();
+    }
+  });
+
+  test("update reads the metadata option once and rejects a non-function before any write", async () => {
+    const notes = await settledCollection({ "a.md": "# A\n\nalpha\n" });
+    const archive = await settledCollection({ "b.md": "# B\n\nbeta\n" });
+    const store = await storeOver({ notes, archive });
+
+    try {
+      await expect(store.update({ metadata: "author" as never })).rejects.toThrow("update() metadata must be a function, received string");
+      expect((await store.getStatus()).totalDocuments).toBe(0);
+
+      let reads = 0;
+      let assigned: DocumentMetadataSource = () => {
+        options.metadata = () => ({ origin: "replacement" });
+        return { origin: "original" };
+      };
+      const options = {
+        get metadata(): DocumentMetadataSource {
+          reads++;
+          return assigned;
+        },
+        set metadata(source: DocumentMetadataSource) {
+          assigned = source;
+        },
+      };
+      await store.update(options);
+      expect(reads).toBe(1);
+      expect(metadataState(store, "a.md")?.metadata_json).toBe('{"origin":"original"}');
+      expect(metadataState(store, "b.md")?.metadata_json).toBe('{"origin":"original"}');
+    } finally {
+      await store.close();
+    }
   });
 });
 

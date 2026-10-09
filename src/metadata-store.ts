@@ -38,6 +38,11 @@ import {
 // Schema
 // =============================================================================
 
+/** Where a document's metadata came from, stored in `document_metadata.source`. */
+export type DocumentMetadataOrigin = "frontmatter" | "external";
+
+const METADATA_SOURCE_COLUMN = `source TEXT NOT NULL DEFAULT 'frontmatter' CHECK (source IN ('frontmatter', 'external'))`;
+
 export function initializeMetadataSchema(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS document_metadata (
@@ -46,9 +51,11 @@ export function initializeMetadataSchema(db: Database): void {
       extraction_version INTEGER NOT NULL,
       extraction_error TEXT,
       extracted_at TEXT NOT NULL,
+      ${METADATA_SOURCE_COLUMN},
       FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
     )
   `);
+  ensureMetadataSourceColumn(db);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS document_metadata_values (
@@ -89,6 +96,34 @@ export function initializeMetadataSchema(db: Database): void {
   `);
 }
 
+/**
+ * Add `document_metadata.source` to an index created before metadata
+ * sources. Every existing row came from frontmatter, so the column default
+ * labels it. This check runs at every open, outside PRAGMA user_version: the
+ * vector step can defer without sqlite-vec and return before any later
+ * version step. Check and ALTER share one IMMEDIATE transaction with a
+ * double-checked read, matching applyVersionedStep, so concurrent first opens
+ * add the column once and migrated opens take no write lock.
+ */
+function ensureMetadataSourceColumn(db: Database): void {
+  if (hasMetadataSourceColumn(db)) return;
+  db.exec(`BEGIN IMMEDIATE`);
+  try {
+    if (!hasMetadataSourceColumn(db)) {
+      db.exec(`ALTER TABLE document_metadata ADD COLUMN ${METADATA_SOURCE_COLUMN}`);
+    }
+    db.exec(`COMMIT`);
+  } catch (err) {
+    db.exec(`ROLLBACK`);
+    throw err;
+  }
+}
+
+function hasMetadataSourceColumn(db: Database): boolean {
+  const columns = db.prepare(`PRAGMA table_info(document_metadata)`).all() as { name: string }[];
+  return columns.some(column => column.name === "source");
+}
+
 // =============================================================================
 // Persistence
 // =============================================================================
@@ -118,22 +153,29 @@ export function syncDocumentMetadata(
  * Replace a document's metadata rows atomically. A failed extraction persists
  * empty metadata plus the error, so stale metadata never survives a bad edit.
  */
-export function replaceDocumentMetadata(db: Database, documentId: number, extraction: MetadataExtractionResult): void {
+export function replaceDocumentMetadata(
+  db: Database,
+  documentId: number,
+  extraction: MetadataExtractionResult,
+  origin: DocumentMetadataOrigin = "frontmatter",
+): void {
   const replace = db.transaction(() => {
     db.prepare(`
-      INSERT INTO document_metadata (document_id, metadata_json, extraction_version, extraction_error, extracted_at)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO document_metadata (document_id, metadata_json, extraction_version, extraction_error, extracted_at, source)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(document_id) DO UPDATE SET
         metadata_json = excluded.metadata_json,
         extraction_version = excluded.extraction_version,
         extraction_error = excluded.extraction_error,
-        extracted_at = excluded.extracted_at
+        extracted_at = excluded.extracted_at,
+        source = excluded.source
     `).run(
       documentId,
       JSON.stringify(extraction.metadata),
       extraction.extractionVersion,
       extraction.error ?? null,
       new Date().toISOString(),
+      origin,
     );
 
     db.prepare(`DELETE FROM document_metadata_values WHERE document_id = ?`).run(documentId);
@@ -162,10 +204,39 @@ export function replaceDocumentMetadata(db: Database, documentId: number, extrac
   replace();
 }
 
+/**
+ * Persist one metadata source answer as the document's external metadata.
+ * An answer equal to the stored external row keeps that row, its value rows
+ * and its `extracted_at`.
+ */
+export function syncExternalDocumentMetadata(db: Database, documentId: number, extraction: MetadataExtractionResult): void {
+  const stored = db.prepare(`
+    SELECT source, metadata_json, extraction_version, extraction_error
+    FROM document_metadata WHERE document_id = ?
+  `).get(documentId) as {
+    source: DocumentMetadataOrigin;
+    metadata_json: string;
+    extraction_version: number;
+    extraction_error: string | null;
+  } | undefined;
+
+  if (
+    stored?.source === "external"
+    && stored.metadata_json === JSON.stringify(extraction.metadata)
+    && stored.extraction_version === extraction.extractionVersion
+    && stored.extraction_error === (extraction.error ?? null)
+  ) {
+    return;
+  }
+  replaceDocumentMetadata(db, documentId, extraction, "external");
+}
+
+// A row from a metadata source is stale for frontmatter extraction, so a
+// default update re-reads the file and re-extracts it.
 function isDocumentMetadataCurrent(db: Database, documentId: number): boolean {
-  const row = db.prepare(`SELECT extraction_version FROM document_metadata WHERE document_id = ?`)
-    .get(documentId) as { extraction_version: number } | undefined;
-  return row?.extraction_version === METADATA_EXTRACTION_VERSION;
+  const row = db.prepare(`SELECT extraction_version, source FROM document_metadata WHERE document_id = ?`)
+    .get(documentId) as { extraction_version: number; source: DocumentMetadataOrigin } | undefined;
+  return row?.extraction_version === METADATA_EXTRACTION_VERSION && row.source === "frontmatter";
 }
 
 // =============================================================================

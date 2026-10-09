@@ -75,11 +75,17 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
-import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import {
+  METADATA_EXTRACTION_VERSION,
+  askMetadataSource,
+  type DocumentMetadata,
+  type DocumentMetadataSource,
+} from "./metadata.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
   initializeMetadataSchema,
   syncDocumentMetadata,
+  syncExternalDocumentMetadata,
   countDocumentsPendingMetadata,
   getMetadataByFilepath,
   listMetadataCollectionSummaries,
@@ -1696,7 +1702,7 @@ function getFileSyncStateMap(db: Database, collectionName: string): Map<string, 
     // active document as unchanged. A distrusted row is rewritten on reindex.
     const stmt = db.prepare(`
       SELECT s.relative_path, s.mtime_ms, s.size, s.content_hash, s.document_id,
-        COALESCE(dm.extraction_version = ?, 0) AS metadata_current
+        COALESCE(dm.extraction_version = ? AND dm.source = 'frontmatter', 0) AS metadata_current
       FROM file_sync_state s
       JOIN documents d ON d.id = s.document_id
       LEFT JOIN document_metadata dm ON dm.document_id = s.document_id
@@ -1829,6 +1835,8 @@ export async function reindexCollection(
   options?: {
     ignorePatterns?: string[];
     onProgress?: (info: ReindexProgress) => void;
+    /** Replaces frontmatter extraction for every admitted nonblank file. A throw or thenable rejects the scan. */
+    metadataSource?: DocumentMetadataSource;
   }
 ): Promise<ReindexResult> {
   const batch = scanWriteBatch(store.db);
@@ -1851,10 +1859,12 @@ async function reindexCollectionIn(
   options?: {
     ignorePatterns?: string[];
     onProgress?: (info: ReindexProgress) => void;
+    metadataSource?: DocumentMetadataSource;
   }
 ): Promise<ReindexResult> {
   const db = store.db;
   const now = new Date().toISOString();
+  const metadataSource = options?.metadataSource;
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
   const allIgnore = [
@@ -1902,6 +1912,14 @@ async function reindexCollectionIn(
 
   // Load file_sync_state for this collection (mtime+size fast-path)
   const syncStateMap = getFileSyncStateMap(db, collectionName);
+
+  // Both fast paths ask the source with path and content hash. The stat fast
+  // path reads no file bytes; the hash fast path has read them already.
+  const syncSourceMetadata = (source: DocumentMetadataSource, documentId: number, path: string, hash: string): void => {
+    const extraction = askMetadataSource(source, { collection: collectionName, path, hash });
+    syncExternalDocumentMetadata(db, documentId, extraction);
+    if (extraction.error) metadataErrors++;
+  };
 
   for (const relativeFile of files) {
     batch.next();
@@ -1951,7 +1969,8 @@ async function reindexCollectionIn(
     // Missing or stale metadata (an index from before the metadata schema, or
     // an extraction-version bump) needs the content, so such a file is read and
     // re-extracted through the hash-match branch below.
-    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size && cached.metadata_current) {
+    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size && (metadataSource || cached.metadata_current)) {
+      if (metadataSource) syncSourceMetadata(metadataSource, cached.document_id, path, cached.content_hash);
       unchanged++;
       processed++;
       options?.onProgress?.({ file: relativeFile, current: processed, total });
@@ -1992,7 +2011,9 @@ async function reindexCollectionIn(
       // Existing behavior for hash-same was to still do metadata backfill; we preserve it by loading documentId from cache.
       // However we already have content here, so do metadata backfill for hash-match case.
       const existingForMeta = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
-      if (existingForMeta) {
+      if (existingForMeta && metadataSource) {
+        syncSourceMetadata(metadataSource, existingForMeta.id, path, hash);
+      } else if (existingForMeta) {
         const extraction = syncDocumentMetadata(db, existingForMeta.id, content, path, { onlyIfStale: true });
         if (extraction?.error) metadataErrors++;
       }
@@ -2033,9 +2054,13 @@ async function reindexCollectionIn(
     upsertFileSyncState(db, collectionName, path, syncMtimeMs, size, hash, documentId);
 
     // Metadata extraction
-    const extraction = syncDocumentMetadata(db, documentId, content, path,
-      contentChanged ? undefined : { onlyIfStale: true });
-    if (extraction?.error) metadataErrors++;
+    if (metadataSource) {
+      syncSourceMetadata(metadataSource, documentId, path, hash);
+    } else {
+      const extraction = syncDocumentMetadata(db, documentId, content, path,
+        contentChanged ? undefined : { onlyIfStale: true });
+      if (extraction?.error) metadataErrors++;
+    }
 
     processed++;
     options?.onProgress?.({ file: relativeFile, current: processed, total });
