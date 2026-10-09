@@ -12,6 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+import type { EmbedFailure, EmbedProgress } from "./types.js";
 import {
   PartitionWriter,
   VEC_COLLECTION_IDS_TABLE,
@@ -2059,23 +2060,7 @@ async function reindexCollectionIn(
   return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles, metadataErrors };
 }
 
-export type EmbedFailure = {
-  path: string;
-  hash: string;
-  seq: number;
-  attempts: number;
-  reason: string;
-};
-
-export type EmbedProgress = {
-  chunksEmbedded: number;
-  totalChunks: number;
-  bytesProcessed: number;
-  totalBytes: number;
-  /** Active failed chunks still awaiting a successful retry. */
-  errors: number;
-  failures?: EmbedFailure[];
-};
+export type { EmbedFailure, EmbedProgress } from "./types.js";
 
 export type EmbedResult = {
   docsProcessed: number;
