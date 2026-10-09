@@ -5,7 +5,7 @@
  * Uses inline config (no YAML files) to verify the SDK works self-contained.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +22,7 @@ import {
   type VectorSearchOptions,
   type ExpandQueryOptions,
 } from "../src/index.js";
+import * as llmModule from "../src/llm.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
 import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE } from "../src/vec-layout.js";
 
@@ -1013,6 +1014,46 @@ describe("embed", () => {
       expect(result.docsProcessed).toBe(3);
       expect(result.chunksEmbedded).toBe(3);
     } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed forwards maxDurationMs to the embedding session", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+
+    try {
+      await store.update();
+      const rows: Array<[maxDurationMs: number | undefined, maxDuration: number]> = [
+        [undefined, 30 * 60 * 1000],
+        [60 * 60 * 1000, 60 * 60 * 1000],
+        [0, 0],
+      ];
+      for (const [maxDurationMs, maxDuration] of rows) {
+        // force re-embeds every document, so each row opens a session over pending work.
+        const result = await store.embed({ force: true, maxDurationMs });
+
+        expect(result.docsProcessed).toBe(3);
+        expect(sessionSpy).toHaveBeenLastCalledWith(
+          fakeLlm,
+          expect.any(Function),
+          expect.objectContaining({ maxDuration, name: "generateEmbeddings" }),
+        );
+      }
+    } finally {
+      sessionSpy.mockRestore();
       setDefaultLlamaCpp(null);
       await store.close();
     }

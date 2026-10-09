@@ -420,6 +420,11 @@ export interface QMDStore {
     maxDocsPerBatch?: number;
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
+    /**
+     * Wall-clock cap in milliseconds for the whole embed session; batches left at expiry are
+     * skipped. Defaults to 30 minutes; a value <= 0 disables the cap.
+     */
+    maxDurationMs?: number;
     onProgress?: (info: EmbedProgress) => void;
   }): Promise<EmbedResult>;
 
@@ -683,6 +688,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,
+        maxDurationMs: embedOpts?.maxDurationMs,
         onProgress: embedOpts?.onProgress,
       });
     },
