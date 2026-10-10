@@ -2276,6 +2276,7 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
 
 function getPendingEmbeddingDocs(db: Database, collection: string | undefined, model: string, fingerprint: string): PendingEmbeddingDoc[] {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
+  // Stale rows keep a hash pending so a resumed embed can finish replacement cleanup.
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
@@ -2288,7 +2289,13 @@ function getPendingEmbeddingDocs(db: Database, collection: string | undefined, m
         GROUP BY hash, model, embed_fingerprint
       ) v ON d.hash = v.hash
       WHERE d.active = 1
-        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        AND (
+          v.hash IS NULL OR v.chunk_count < v.expected_chunks
+          OR EXISTS (
+            SELECT 1 FROM content_vectors stale
+            WHERE stale.hash = d.hash AND (stale.model != ? OR stale.embed_fingerprint != ?)
+          )
+        )
         ${collectionFilter}
       GROUP BY d.hash
       ORDER BY MIN(d.path)
@@ -2296,8 +2303,8 @@ function getPendingEmbeddingDocs(db: Database, collection: string | undefined, m
     // Large-result query (up to 9k docs): stream via iterate() instead of .all() to bound V8 heap
     const results: PendingEmbeddingDoc[] = [];
     const iter = collection
-      ? stmt.iterate(model, fingerprint, collection)
-      : stmt.iterate(model, fingerprint);
+      ? stmt.iterate(model, fingerprint, model, fingerprint, collection)
+      : stmt.iterate(model, fingerprint, model, fingerprint);
     for (const row of iter as IterableIterator<PendingEmbeddingDoc>) {
       results.push(row);
     }
@@ -3031,10 +3038,16 @@ export function getHashesNeedingEmbedding(db: Database, collection?: string, mod
         GROUP BY hash, model, embed_fingerprint
       ) v ON d.hash = v.hash
       WHERE d.active = 1
-        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        AND (
+          v.hash IS NULL OR v.chunk_count < v.expected_chunks
+          OR EXISTS (
+            SELECT 1 FROM content_vectors stale
+            WHERE stale.hash = d.hash AND (stale.model != ? OR stale.embed_fingerprint != ?)
+          )
+        )
         ${collectionFilter}
     `);
-    const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
+    const result = (collection ? stmt.get(model, fingerprint, model, fingerprint, collection) : stmt.get(model, fingerprint, model, fingerprint)) as { count: number };
     return result.count;
   });
 }
@@ -5070,12 +5083,18 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
       GROUP BY hash, model, embed_fingerprint
     ) v ON d.hash = v.hash
     WHERE d.active = 1
-      AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+      AND (
+        v.hash IS NULL OR v.chunk_count < v.expected_chunks
+        OR EXISTS (
+          SELECT 1 FROM content_vectors stale
+          WHERE stale.hash = d.hash AND (stale.model != ? OR stale.embed_fingerprint != ?)
+        )
+      )
     GROUP BY d.hash
   `);
     // Large-result query (up to 9k): use iterate() to stream, bound heap
     const results: { hash: string; body: string; path: string }[] = [];
-    for (const row of stmt.iterate(model, fingerprint) as IterableIterator<{ hash: string; body: string; path: string }>) {
+    for (const row of stmt.iterate(model, fingerprint, model, fingerprint) as IterableIterator<{ hash: string; body: string; path: string }>) {
       results.push(row);
     }
     return results;

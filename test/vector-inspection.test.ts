@@ -319,9 +319,9 @@ describe("inspectVectorIndex", () => {
       getEmbeddingFingerprint(OTHER_MODEL),
     );
 
-    expect(s.getHashesNeedingEmbedding(MODEL)).toBe(0);
+    expect(s.getHashesNeedingEmbedding(MODEL)).toBe(1);
     expect(inspectStore(s)).toMatchObject({
-      needsEmbedding: 0,
+      needsEmbedding: 1,
       inconsistentChunkLayouts: 3,
       requiredPartitionRows: 8,
       missingRequiredPartitionRows: 0,

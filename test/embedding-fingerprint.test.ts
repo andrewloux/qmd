@@ -16,6 +16,7 @@ import {
   generateEmbeddings,
   getEmbeddingChunkStrategy,
   getEmbeddingFingerprint,
+  getHashesForEmbedding,
   getHashesNeedingEmbedding,
   getIndexEmbeddingFingerprint,
   insertContent,
@@ -38,7 +39,7 @@ const PRE_VERSION_FINGERPRINT = "d78403";
  * their own and need no version bump.
  */
 const LAYOUT_SHA256_BY_VERSION: Record<number, string> = {
-  1: "6bc019b03c5826774cca665181e85c2ff7fc68c6b4b840dc810825b5778bed10",
+  1: "e5335afa65dcf7847b53faf0a8b853c0ef6ad7d78883ab591040f4159bbd0b4c",
 };
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -97,6 +98,10 @@ const TYPESCRIPT = Array.from({ length: 60 }, (_, index) => [
 
 const OTHER_BODY = "# Other\n\nAn unrelated document with one chunk.";
 
+/** "###" headings near the first-pass cuts, so the h3 break score decides where chunks end. */
+const PROBE_H3 = Array.from({ length: 12 }, (_, index) =>
+  `### Step ${index}\n\n` + `Step ${index} explains one synthetic task in plain words. `.repeat(6)).join("\n\n");
+
 /** Inputs whose boundaries the pin covers: break points, re-cuts, equal starts, surrogate pairs, AST and one chunk. */
 const GOLDEN_CORPUS: Array<{ name: string; body: string; tokensPerChar: number; filepath?: string; strategy?: ChunkStrategy }> = [
   { name: "markdown", body: MARKDOWN, tokensPerChar: 1 / 4 },
@@ -105,6 +110,7 @@ const GOLDEN_CORPUS: Array<{ name: string; body: string; tokensPerChar: number; 
   { name: "unicode", body: UNICODE, tokensPerChar: 1 / 3 },
   { name: "typescript-ast", body: TYPESCRIPT, tokensPerChar: 1 / 4, filepath: "handlers.ts", strategy: "auto" },
   { name: "short", body: "# Title\n\nOne short paragraph.", tokensPerChar: 1 / 4 },
+  { name: "heading-boundary", body: PROBE_H3, tokensPerChar: 1 / 4 },
 ];
 
 async function chunkWith(body: string, tokensPerChar: number, filepath?: string, strategy?: ChunkStrategy) {
@@ -289,6 +295,50 @@ describe("embedding replacement", () => {
       .toEqual(expected.map((_, seq) => ({ seq, vector: 1 })));
     expect(storedRows(s, "other")).toEqual(otherRows);
     expect(partitionPeers(s, "other")).toEqual(otherPeers);
+    expect(inspect(s)).toMatchObject({
+      needsEmbedding: 0,
+      inconsistentChunkLayouts: 0,
+      missingRequiredPartitionRows: 0,
+      inconsistentPeerRows: 0,
+      structurallyReady: true,
+    });
+    expect(await generateEmbeddings(s, { model: MODEL })).toMatchObject({ docsProcessed: 0, chunksEmbedded: 0 });
+  });
+
+  test("a completed replacement interrupted before cleanup stays pending until a run retires its stale tail", async () => {
+    const s = await openStore();
+    s.ensureVecTable(3);
+    seedDocument(s, "docs", "doc", "doc.md", MARKDOWN);
+    s.llm = new CountingTokenLlm(1 / 4);
+    const expected = await chunkWith(MARKDOWN, 1 / 4);
+    seedStaleRows(s, "doc", expected.length + 2);
+    const current = getEmbeddingFingerprint(MODEL);
+    const currentRows = expected.map((chunk, seq) => ({ seq, pos: chunk.pos, total: expected.length, fingerprint: current }));
+    // Every current row commits in the first embedding batch; progress reporting then stops the run before cleanup.
+    const interrupted = new Error("interrupted after the current rows committed");
+    await expect(generateEmbeddings(s, {
+      model: MODEL,
+      onProgress: (progress) => {
+        if (progress.chunksEmbedded === expected.length) throw interrupted;
+      },
+    })).rejects.toBe(interrupted);
+
+    expect(storedRows(s, "doc")).toEqual([
+      ...currentRows,
+      ...[expected.length, expected.length + 1].map(seq => ({ seq, pos: seq * 100, total: expected.length + 2, fingerprint: PRE_VERSION_FINGERPRINT })),
+    ]);
+    expect(partitionPeers(s, "doc")).toHaveLength(expected.length + 2);
+    expect(getHashesNeedingEmbedding(s.db, undefined, MODEL)).toBe(1);
+    expect(getHashesNeedingEmbedding(s.db, "docs", MODEL)).toBe(1);
+    expect(getHashesForEmbedding(s.db, MODEL).map(row => row.hash)).toEqual(["doc"]);
+    expect(inspect(s)).toMatchObject({ needsEmbedding: 1, structurallyReady: false });
+
+    expect(await generateEmbeddings(s, { model: MODEL }))
+      .toMatchObject({ docsProcessed: 1, chunksEmbedded: expected.length, errors: 0 });
+
+    expect(storedRows(s, "doc")).toEqual(currentRows);
+    expect(partitionPeers(s, "doc").map(({ seq, vector }) => ({ seq, vector })))
+      .toEqual(expected.map((_, seq) => ({ seq, vector: 1 })));
     expect(inspect(s)).toMatchObject({
       needsEmbedding: 0,
       inconsistentChunkLayouts: 0,
