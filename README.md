@@ -334,6 +334,11 @@ const expanded = await store.expandQuery("auth flow", { intent: "user login" })
 const results4 = await store.search({ queries: expanded })
 ```
 
+`searchCandidates()` admits distinct metadata groups before rank fusion and
+returns contribution traces and coverage. See [grouped candidate retrieval](docs/CANDIDATE-SEARCH.md)
+and [source locations and configurable passages](docs/SEARCH-LOCATIONS.md).
+`inspectVectorIndex()` supplies an explicit [structural publication check](docs/VECTOR-INSPECTION.md).
+
 #### Retrieval
 
 ```typescript
@@ -414,7 +419,7 @@ const result = await store.update({
 // Generate vector embeddings
 const embedResult = await store.embed({
   force: false,           // true to re-embed everything
-  chunkStrategy: "auto",  // "regex" (default) or "auto" (AST for code files)
+  chunkStrategy: "auto",  // recorded for the index; omit to keep it ("regex" for a new index)
   onProgress: ({ current, total, collection }) => {
     console.log(`Embedding ${current}/${total}`)
   },
@@ -698,12 +703,17 @@ positions. This produces higher-quality chunks and better search results for
 codebases. Markdown and other file types always use regex-based chunking
 regardless of strategy.
 
-The default is `regex` (existing behavior). Use `--chunk-strategy auto` to
-opt in. Run `qmd status` to verify which grammars are available.
+`qmd embed --chunk-strategy auto` records `auto` as the index's chunk
+strategy, and later `qmd embed` runs without the flag keep it. An index without
+a recorded strategy uses `regex`. Changing the strategy marks vectors under
+the previous strategy pending, because vectors are stored per content hash.
+A scoped run rebuilds the selected collection; the remaining old-strategy
+hashes stay pending. `qmd query --chunk-strategy` applies to that query only.
+Run `qmd status` to verify which grammars are available.
 
-> **Note:** Tree-sitter grammars are optional dependencies. If they are not
-> installed, `--chunk-strategy auto` falls back to regex-only chunking
-> automatically. Tested on both Node.js and Bun.
+> **Note:** Tree-sitter grammars supply AST boundaries for supported code files.
+> An unavailable grammar makes `--chunk-strategy auto` use regex chunking for
+> that language. Tested on both Node.js and Bun.
 
 ### Context Management
 

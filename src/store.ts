@@ -12,6 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+import type { EmbedFailure, EmbedProgress } from "./types.js";
 import {
   PartitionWriter,
   VEC_COLLECTION_IDS_TABLE,
@@ -47,6 +48,8 @@ import {
   type VectorMigrationProgress,
 } from "./store-migrations.js";
 import type { Database, SQLiteValue } from "./db.js";
+import { inspectVectorIndex, type VectorIndexInspection } from "./vector-inspection.js";
+import { normalizeCjkForFTS, parseLexicalQuery } from "./lexical-query.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
@@ -63,6 +66,7 @@ import {
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
   type RerankDocument,
+  type RerankTokenBudget,
   type ILLMSession,
 } from "./llm.js";
 import type {
@@ -71,17 +75,25 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
-import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import {
+  METADATA_EXTRACTION_VERSION,
+  askMetadataSource,
+  type DocumentMetadata,
+  type DocumentMetadataSource,
+} from "./metadata.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
   initializeMetadataSchema,
   syncDocumentMetadata,
+  syncExternalDocumentMetadata,
   countDocumentsPendingMetadata,
   getMetadataByFilepath,
   listMetadataCollectionSummaries,
   parseMetadataJson,
   type MetadataKeyOverview,
 } from "./metadata-store.js";
+
+export { normalizeCjkForFTS, sanitizeFTS5Term } from "./lexical-query.js";
 
 // =============================================================================
 // Configuration
@@ -172,15 +184,60 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
 
-export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): string {
+/**
+ * Identity of the chunk-boundary algorithm. Bump it whenever the same input,
+ * tokenizer, options and strategy can produce different chunk boundaries. The
+ * embedding fingerprint includes it, so vectors stored under older boundaries
+ * become pending. test/embedding-fingerprint.test.ts pins its layout digest.
+ */
+export const CHUNKER_VERSION = 1;
+
+/**
+ * Identity of the vectors QMD would produce for a model and chunk strategy:
+ * model name, embedding input formats, chunk size, overlap, break-point
+ * window, chunker version and strategy. Computed from constants alone, so
+ * status and inspection need no model. Six lowercase hex digits.
+ */
+export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL, chunkStrategy: ChunkStrategy = "regex"): string {
   const significant = [
     `model:${model}`,
     `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+    `chunk_window_tokens:${CHUNK_WINDOW_TOKENS}`,
+    `chunker:${CHUNKER_VERSION}`,
+    `chunk_strategy:${validChunkStrategy(chunkStrategy, "chunkStrategy")}`,
   ].join("\n");
   return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+}
+
+/** store_config key of the index-wide chunk strategy that embedding uses. */
+const EMBEDDING_CHUNK_STRATEGY_KEY = "embedding_chunk_strategy";
+
+function validChunkStrategy(value: unknown, label: string): ChunkStrategy {
+  if (value === "regex" || value === "auto") return value;
+  throw new Error(`${label} must be "auto" or "regex" (got ${JSON.stringify(value)})`);
+}
+
+/**
+ * The index-wide chunk strategy: the one the last explicit embed recorded, or
+ * "regex" for an index with none. Vectors are stored per content hash, and one
+ * hash can sit in several collections, so the strategy belongs to the index.
+ */
+export function getEmbeddingChunkStrategy(db: Database): ChunkStrategy {
+  const row = db.prepare(`SELECT value FROM store_config WHERE key = ?`).get(EMBEDDING_CHUNK_STRATEGY_KEY) as { value: string } | null | undefined;
+  return row ? validChunkStrategy(row.value, `store_config ${EMBEDDING_CHUNK_STRATEGY_KEY}`) : "regex";
+}
+
+function setEmbeddingChunkStrategy(db: Database, chunkStrategy: ChunkStrategy): void {
+  db.prepare(`INSERT INTO store_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    .run(EMBEDDING_CHUNK_STRATEGY_KEY, chunkStrategy);
+}
+
+/** The fingerprint of the vectors this index accepts as current: the model under the stored chunk strategy. */
+export function getIndexEmbeddingFingerprint(db: Database, model: string = DEFAULT_EMBED_MODEL): string {
+  return getEmbeddingFingerprint(model, getEmbeddingChunkStrategy(db));
 }
 
 /**
@@ -919,35 +976,7 @@ export function verifySqliteVecLoaded(db: Database): void {
 
 let _sqliteVecAvailable: boolean | null = null;
 
-const CJK_CHAR_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-const CJK_RUN_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 const FTS_CJK_NORMALIZED_VERSION = "1";
-
-/**
- * FTS5's unicode61 tokenizer does not segment CJK text into searchable words.
- * Normalize CJK runs by spacing every character so exact CJK queries can be
- * translated into phrase queries while Latin text keeps the default tokenizer.
- */
-export function normalizeCjkForFTS(text: string): string {
-  return text.replace(CJK_RUN_PATTERN, run => ` ${Array.from(run).join(' ')} `);
-}
-
-function containsCjk(text: string): boolean {
-  return CJK_CHAR_PATTERN.test(text);
-}
-
-function sanitizeFTS5Phrase(phrase: string): string {
-  // A quoted phrase is matched against tokens the porter unicode61 tokenizer
-  // produced, and that tokenizer splits document text on every separator.
-  // Deleting the separators here instead would collapse "1.0.21" to "1021" and
-  // "PIO-1384" to "pio1384", tokens no document holds, so the query returns
-  // nothing with no error (#757 for dots, #916 for the rest). Split on the same
-  // separators the tokenizer does and emit the parts as adjacent phrase terms.
-  return normalizeCjkForFTS(phrase)
-    .split(/\s+/)
-    .flatMap(t => splitFTS5CompoundTerm(t))
-    .join(' ');
-}
 
 // FTS sync triggers keep documents_fts current for callers that write directly
 // to documents (production indexing rebuilds FTS in TypeScript to normalize CJK
@@ -1593,6 +1622,7 @@ export type Store = {
   // Index health
   getHashesNeedingEmbedding: (model?: string) => number;
   getIndexHealth: (model?: string) => IndexHealthInfo;
+  inspectVectorIndex: (model?: string) => VectorIndexInspection;
   getStatus: (model?: string) => IndexStatus;
   getStatusSummary: (model?: string) => IndexStatusSummary;
 
@@ -1624,11 +1654,12 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
+  getRerankTokenBudget: (query: string, intent?: string) => Promise<RerankTokenBudget>;
   /** Drop the cached expansion for a query so the next call regenerates. */
   invalidateExpansionCache: (query: string) => void;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
@@ -1690,7 +1721,7 @@ export type ReindexResult = {
   orphanedCleaned: number;
   skipped: number;
   skippedFiles: ReindexSkippedFile[];
-  /** Documents whose qmd.metadata frontmatter failed extraction this pass. */
+  /** Documents whose qmd.metadata frontmatter or metadata source answer failed extraction this pass. */
   metadataErrors: number;
 };
 
@@ -1704,7 +1735,7 @@ type FileSyncStateRow = {
   size: number;
   content_hash: string;
   document_id: number;
-  /** 1 when the document has a metadata extraction at the current version. */
+  /** 1 when the document has a frontmatter metadata extraction at the current version. */
   metadata_current: number;
 };
 
@@ -1716,7 +1747,7 @@ function getFileSyncStateMap(db: Database, collectionName: string): Map<string, 
     // active document as unchanged. A distrusted row is rewritten on reindex.
     const stmt = db.prepare(`
       SELECT s.relative_path, s.mtime_ms, s.size, s.content_hash, s.document_id,
-        COALESCE(dm.extraction_version = ?, 0) AS metadata_current
+        COALESCE(dm.extraction_version = ? AND dm.source = 'frontmatter', 0) AS metadata_current
       FROM file_sync_state s
       JOIN documents d ON d.id = s.document_id
       LEFT JOIN document_metadata dm ON dm.document_id = s.document_id
@@ -1838,7 +1869,7 @@ export function scanWriteBatch(db: Database, maxFiles: number = 500, maxMs: numb
  * Pure function — no console output, no db lifecycle management.
  *
  * Fast-path: stat mtime_ms+size against cached row to skip file read.
- * If mtime changed but content hash identical, only mtime cache is updated.
+ * If mtime changed but content hash identical, the mtime cache is updated and metadata is synced.
  * Skips >10MB and empty files, cleans sync table entry on orphan removal.
  */
 export async function reindexCollection(
@@ -1849,6 +1880,8 @@ export async function reindexCollection(
   options?: {
     ignorePatterns?: string[];
     onProgress?: (info: ReindexProgress) => void;
+    /** Replaces frontmatter extraction for every admitted nonblank file. A throw or thenable rejects the scan. */
+    metadataSource?: DocumentMetadataSource;
   }
 ): Promise<ReindexResult> {
   const batch = scanWriteBatch(store.db);
@@ -1871,10 +1904,12 @@ async function reindexCollectionIn(
   options?: {
     ignorePatterns?: string[];
     onProgress?: (info: ReindexProgress) => void;
+    metadataSource?: DocumentMetadataSource;
   }
 ): Promise<ReindexResult> {
   const db = store.db;
   const now = new Date().toISOString();
+  const metadataSource = options?.metadataSource;
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
   const allIgnore = [
@@ -1923,6 +1958,14 @@ async function reindexCollectionIn(
   // Load file_sync_state for this collection (mtime+size fast-path)
   const syncStateMap = getFileSyncStateMap(db, collectionName);
 
+  // Both fast paths ask the source with path and content hash. The stat fast
+  // path reads no file bytes; the hash fast path has read them already.
+  const syncSourceMetadata = (source: DocumentMetadataSource, documentId: number, path: string, hash: string): void => {
+    const extraction = askMetadataSource(source, { collection: collectionName, path, hash });
+    syncExternalDocumentMetadata(db, documentId, extraction);
+    if (extraction.error) metadataErrors++;
+  };
+
   for (const relativeFile of files) {
     batch.next();
     const path = normalizePathSeparators(relativeFile);
@@ -1968,16 +2011,19 @@ async function reindexCollectionIn(
 
     // Fast-path: stat matches cached sync state — skip read entirely
     const cached = syncStateMap.get(path);
-    // Missing or stale metadata (an index from before the metadata schema, or
-    // an extraction-version bump) needs the content, so such a file is read and
-    // re-extracted through the hash-match branch below.
-    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size && cached.metadata_current) {
+    // Without a metadata source, missing or stale metadata (an index from
+    // before the metadata schema, an extraction-version bump, or a row from a
+    // metadata source) needs the content, so such a file is read and
+    // re-extracted through the hash-match branch below. A metadata source
+    // answers from the cached hash, so this path asks it without a read.
+    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size && (metadataSource || cached.metadata_current)) {
+      if (metadataSource) syncSourceMetadata(metadataSource, cached.document_id, path, cached.content_hash);
       unchanged++;
       processed++;
       options?.onProgress?.({ file: relativeFile, current: processed, total });
       // Still need to ensure document exists (might have been deactivated externally)
-      // But we count as unchanged and avoid expensive read+hash+metadata sync.
-      // Note: metadata sync for unchanged is skipped in fast-path; if needed, disable fast-path or force re-read.
+      // The scan counts the file as unchanged and skips the read and hash.
+      // Note: frontmatter metadata sync for unchanged is skipped in fast-path; a metadata source is asked above.
       continue;
     }
 
@@ -2008,11 +2054,12 @@ async function reindexCollectionIn(
       upsertFileSyncState(db, collectionName, path, syncMtimeMs, size, hash, cached.document_id);
       unchanged++;
       processed++;
-      // Keep content in memory for metadata sync if needed? For speed, skip metadata sync on hash-match fast-path.
-      // Existing behavior for hash-same was to still do metadata backfill; we preserve it by loading documentId from cache.
-      // However we already have content here, so do metadata backfill for hash-match case.
+      // The file was read, so metadata syncs here: a metadata source is asked
+      // with the unchanged hash, and frontmatter is backfilled when missing or stale.
       const existingForMeta = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
-      if (existingForMeta) {
+      if (existingForMeta && metadataSource) {
+        syncSourceMetadata(metadataSource, existingForMeta.id, path, hash);
+      } else if (existingForMeta) {
         const extraction = syncDocumentMetadata(db, existingForMeta.id, content, path, { onlyIfStale: true });
         if (extraction?.error) metadataErrors++;
       }
@@ -2053,9 +2100,13 @@ async function reindexCollectionIn(
     upsertFileSyncState(db, collectionName, path, syncMtimeMs, size, hash, documentId);
 
     // Metadata extraction
-    const extraction = syncDocumentMetadata(db, documentId, content, path,
-      contentChanged ? undefined : { onlyIfStale: true });
-    if (extraction?.error) metadataErrors++;
+    if (metadataSource) {
+      syncSourceMetadata(metadataSource, documentId, path, hash);
+    } else {
+      const extraction = syncDocumentMetadata(db, documentId, content, path,
+        contentChanged ? undefined : { onlyIfStale: true });
+      if (extraction?.error) metadataErrors++;
+    }
 
     processed++;
     options?.onProgress?.({ file: relativeFile, current: processed, total });
@@ -2080,23 +2131,7 @@ async function reindexCollectionIn(
   return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles, metadataErrors };
 }
 
-export type EmbedFailure = {
-  path: string;
-  hash: string;
-  seq: number;
-  attempts: number;
-  reason: string;
-};
-
-export type EmbedProgress = {
-  chunksEmbedded: number;
-  totalChunks: number;
-  bytesProcessed: number;
-  totalBytes: number;
-  /** Active failed chunks still awaiting a successful retry. */
-  errors: number;
-  failures?: EmbedFailure[];
-};
+export type { EmbedFailure, EmbedProgress } from "./types.js";
 
 export type EmbedResult = {
   docsProcessed: number;
@@ -2240,9 +2275,9 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
-function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+function getPendingEmbeddingDocs(db: Database, collection: string | undefined, model: string, fingerprint: string): PendingEmbeddingDoc[] {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
+  // Stale rows keep a hash pending so a resumed embed can finish replacement cleanup.
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
@@ -2255,7 +2290,13 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
         GROUP BY hash, model, embed_fingerprint
       ) v ON d.hash = v.hash
       WHERE d.active = 1
-        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        AND (
+          v.hash IS NULL OR v.chunk_count < v.expected_chunks
+          OR EXISTS (
+            SELECT 1 FROM content_vectors stale
+            WHERE stale.hash = d.hash AND (stale.model != ? OR stale.embed_fingerprint != ?)
+          )
+        )
         ${collectionFilter}
       GROUP BY d.hash
       ORDER BY MIN(d.path)
@@ -2263,8 +2304,8 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
     // Large-result query (up to 9k docs): stream via iterate() instead of .all() to bound V8 heap
     const results: PendingEmbeddingDoc[] = [];
     const iter = collection
-      ? stmt.iterate(model, fingerprint, collection)
-      : stmt.iterate(model, fingerprint);
+      ? stmt.iterate(model, fingerprint, model, fingerprint, collection)
+      : stmt.iterate(model, fingerprint, model, fingerprint);
     for (const row of iter as IterableIterator<PendingEmbeddingDoc>) {
       results.push(row);
     }
@@ -2337,17 +2378,24 @@ export async function generateEmbeddings(
   const db = store.db;
   const llm = getLlm(store);
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
-  const fingerprint = getEmbeddingFingerprint(model);
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
+  // An explicit strategy becomes the index-wide policy before pending work is
+  // chosen; an omitted one keeps the stored policy. An invalid explicit or
+  // stored strategy throws here, before any vector write.
+  const chunkStrategy = options?.chunkStrategy === undefined
+    ? getEmbeddingChunkStrategy(db)
+    : validChunkStrategy(options.chunkStrategy, "chunkStrategy");
+  if (options?.chunkStrategy !== undefined) setEmbeddingChunkStrategy(db, chunkStrategy);
+  const fingerprint = getEmbeddingFingerprint(model, chunkStrategy);
 
   if (options?.force) {
     clearAllEmbeddings(db, options?.collection);
   }
 
   const chunksCopied = copyVectorsToNewCollections(db, options?.collection).copied;
-  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
+  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model, fingerprint);
 
   if (docsToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, chunksCopied, errors: 0, durationMs: 0 };
@@ -2362,6 +2410,12 @@ export async function generateEmbeddings(
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
     let chunksEmbedded = 0;
+    // Current rows this run wrote, per hash: cleanup subtracts only these.
+    const writtenByHash = new Map<string, number>();
+    const countWrite = (chunk: ChunkItem) => {
+      chunksEmbedded++;
+      writtenByHash.set(chunk.hash, (writtenByHash.get(chunk.hash) ?? 0) + 1);
+    };
     let bytesProcessed = 0;
     let totalChunks = 0;
     let vectorTableInitialized = false;
@@ -2405,7 +2459,7 @@ export async function generateEmbeddings(
           return false;
         }
         insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
-        chunksEmbedded++;
+        countWrite(chunk);
         successesSinceRetry++;
         clearFailure(chunk);
         return true;
@@ -2460,7 +2514,7 @@ export async function generateEmbeddings(
           doc.body,
           undefined, undefined, undefined,
           doc.path,
-          options?.chunkStrategy,
+          chunkStrategy,
           session.signal,
         );
 
@@ -2544,7 +2598,7 @@ export async function generateEmbeddings(
             }
           }).immediate();
           for (const chunk of stored) {
-            chunksEmbedded++;
+            countWrite(chunk);
             successesSinceRetry++;
             clearFailure(chunk);
           }
@@ -2583,9 +2637,9 @@ export async function generateEmbeddings(
 
       await retryFailedChunks(true);
 
-      const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
-      if (removedPartialChunks > 0) {
-        chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
+      const removedCurrentChunks = settleAttemptedEmbeddings(db, expectedChunksByHash, model, fingerprint, writtenByHash);
+      if (removedCurrentChunks > 0) {
+        chunksEmbedded = Math.max(0, chunksEmbedded - removedCurrentChunks);
       }
 
       bytesProcessed += batchBytes;
@@ -2626,6 +2680,16 @@ export function createStore(dbPath?: string): Store {
     // Index health
     getHashesNeedingEmbedding: (model?: string) => getHashesNeedingEmbedding(db, undefined, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
     getIndexHealth: (model?: string) => getIndexHealth(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
+    inspectVectorIndex: (model?: string) => {
+      const selectedModel = model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL;
+      const embeddingFingerprint = getIndexEmbeddingFingerprint(db, selectedModel);
+      return inspectVectorIndex(
+        db,
+        selectedModel,
+        embeddingFingerprint,
+        () => getHashesNeedingEmbedding(db, undefined, selectedModel),
+      );
+    },
     getStatus: (model?: string) => getStatus(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
     getStatusSummary: (model?: string) => getStatusSummary(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
 
@@ -2657,11 +2721,12 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => searchFTS(db, query, limit, collectionName, filter),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter),
+    searchFTS: (query, limit, collectionName, filter, retrieval) => searchFTS(db, query, limit, collectionName, filter, retrieval),
+    searchVec: (query, model, limit, collectionName, session, precomputedEmbedding, filter, retrieval) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter, retrieval),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
+    getRerankTokenBudget: (query, intent) => getLlm(store).getRerankTokenBudget(formatRerankQuery(query, intent)),
     invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
       // Cache keys must use the resolved rerank model (store.llm or the global
@@ -2806,6 +2871,7 @@ export type SearchResult = DocumentResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
+  chunkSeq?: number;          // Stored chunk sequence, returned by compact vector retrieval
 };
 
 /**
@@ -2953,9 +3019,15 @@ export function getEmbeddingVectorSamples(db: Database, model: string, fingerpri
   `).all<EmbeddingVectorSample>(model, fingerprint, sampleSize);
 }
 
-export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
+/**
+ * Active hashes without complete vectors under `chunkStrategy`, or under the
+ * stored index-wide strategy when it is omitted.
+ */
+export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL, chunkStrategy?: ChunkStrategy): number {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = chunkStrategy === undefined
+    ? getIndexEmbeddingFingerprint(db, model)
+    : getEmbeddingFingerprint(model, validChunkStrategy(chunkStrategy, "chunkStrategy"));
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT COUNT(DISTINCT d.hash) as count
@@ -2967,10 +3039,16 @@ export function getHashesNeedingEmbedding(db: Database, collection?: string, mod
         GROUP BY hash, model, embed_fingerprint
       ) v ON d.hash = v.hash
       WHERE d.active = 1
-        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        AND (
+          v.hash IS NULL OR v.chunk_count < v.expected_chunks
+          OR EXISTS (
+            SELECT 1 FROM content_vectors stale
+            WHERE stale.hash = d.hash AND (stale.model != ? OR stale.embed_fingerprint != ?)
+          )
+        )
         ${collectionFilter}
     `);
-    const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
+    const result = (collection ? stmt.get(model, fingerprint, model, fingerprint, collection) : stmt.get(model, fingerprint, model, fingerprint)) as { count: number };
     return result.count;
   });
 }
@@ -2989,7 +3067,8 @@ export type LegacyFingerprintAdoptionResult = {
 
 export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
   const db = store.db;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const chunkStrategy = getEmbeddingChunkStrategy(db);
+  const fingerprint = getEmbeddingFingerprint(model, chunkStrategy);
   const legacyCount = withLazyContentVectorMigration(db, () => {
     const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(model) as { count: number };
     return row.count;
@@ -3052,7 +3131,7 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
       undefined,
       undefined,
       sample.path,
-      undefined,
+      chunkStrategy,
       session.signal,
     );
     const chunk = chunks[sample.seq];
@@ -4523,37 +4602,6 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // FTS Search
 // =============================================================================
 
-export function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}'_]/gu, '').toLowerCase();
-}
-
-/**
- * A run of characters the FTS tokenizer treats as a separator.
- *
- * `documents_fts` is tokenized with `porter unicode61`, which starts a new
- * token at every character that is not a letter or a digit. Underscore is one
- * of those, but it is deliberately kept here rather than split on: FTS5 applies
- * the same tokenizer to a quoted phrase, so leaving `apply_secrets` intact lets
- * it split symmetrically into `apply secrets` on both sides, and that is the
- * behaviour #305 shipped. The apostrophe is kept for the same reason.
- */
-const FTS5_SEPARATOR_RUN = /[^\p{L}\p{N}'_]+/u;
-
-/**
- * Split one query term the way the tokenizer split the document text, and
- * sanitize each part.
- *
- * `PIO-1384` becomes ["pio", "1384"], `src/lib/i18n.ts` becomes
- * ["src", "lib", "i18n", "ts"], and a term with no separator in it comes back
- * as a single part. Callers join the parts into an FTS5 phrase, which is what
- * makes the parts have to be adjacent in the document rather than merely all
- * present. Parts that sanitize to nothing are dropped, so a term that is all
- * punctuation yields an empty list and the caller skips it.
- */
-function splitFTS5CompoundTerm(term: string): string[] {
-  return term.split(FTS5_SEPARATOR_RUN).map(p => sanitizeFTS5Term(p)).filter(p => p);
-}
-
 /**
  * Parse lex query syntax into FTS5 query.
  *
@@ -4582,89 +4630,13 @@ function splitFTS5CompoundTerm(term: string): string[] {
  *   src/lib/i18n.ts         → "src lib i18n ts"
  */
 function buildFTS5Query(query: string): string | null {
-  const positive: string[] = [];
-  const negative: string[] = [];
-
-  let i = 0;
-  const s = query.trim();
-
-  while (i < s.length) {
-    // Skip whitespace
-    while (i < s.length && /\s/.test(s[i]!)) i++;
-    if (i >= s.length) break;
-
-    // Check for negation prefix
-    const negated = s[i] === '-';
-    if (negated) i++;
-
-    // Check for quoted phrase
-    if (s[i] === '"') {
-      const start = i + 1;
-      i++;
-      while (i < s.length && s[i] !== '"') i++;
-      const phrase = s.slice(start, i).trim();
-      i++; // skip closing quote
-      if (phrase.length > 0) {
-        const sanitized = sanitizeFTS5Phrase(phrase);
-        if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // Exact phrase, no prefix match
-          if (negated) {
-            negative.push(ftsPhrase);
-          } else {
-            positive.push(ftsPhrase);
-          }
-        }
-      }
-    } else {
-      // Plain term (until whitespace or quote)
-      const start = i;
-      while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
-      const term = s.slice(start, i);
-
-      if (containsCjk(term)) {
-        const sanitized = sanitizeFTS5Phrase(term);
-        if (sanitized) {
-          const ftsPhrase = `"${sanitized}"`;  // CJK phrase over character tokens
-          if (negated) {
-            negative.push(ftsPhrase);
-          } else {
-            positive.push(ftsPhrase);
-          }
-        }
-      } else {
-        // Any separator inside the term (multi-agent, DEC-0054, 2026.4.10,
-        // src/lib/i18n.ts, @tobilu/qmd) split it at index time too, so the term
-        // has to be matched as the phrase those parts form. A term with no
-        // separator is one part and keeps its prefix match, which is what makes
-        // a plain word still match longer words that start with it.
-        const parts = splitFTS5CompoundTerm(term);
-        if (parts.length > 0) {
-          const ftsTerm = parts.length > 1
-            ? `"${parts.join(' ')}"`   // Phrase match (no prefix)
-            : `"${parts[0]}"*`;        // Prefix match
-          if (negated) {
-            negative.push(ftsTerm);
-          } else {
-            positive.push(ftsTerm);
-          }
-        }
-      }
-    }
-  }
-
-  if (positive.length === 0 && negative.length === 0) return null;
-
-  // If only negative terms, we can't search (FTS5 NOT is binary)
+  const clauses = parseLexicalQuery(query);
+  const positive = clauses.filter(clause => !clause.negated).map(clause => clause.ftsExpression);
+  const negative = clauses.filter(clause => clause.negated).map(clause => clause.ftsExpression);
   if (positive.length === 0) return null;
 
-  // Join positive terms with AND
-  let result = positive.join(' AND ');
-
-  // Add NOT clause for negative terms
-  for (const neg of negative) {
-    result = `${result} NOT ${neg}`;
-  }
-
+  let result = positive.join(" AND ");
+  for (const expression of negative) result += ` NOT ${expression}`;
   return result;
 }
 
@@ -4707,7 +4679,25 @@ function compareFilepaths(a: { filepath: string }, b: { filepath: string }): num
   return a.filepath < b.filepath ? -1 : a.filepath > b.filepath ? 1 : 0;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
+export type VectorScanCoverage = {
+  collectionId: number | null;
+  collectionName: string | null;
+  requestedK: number;
+  matchedChunks: number;
+  resolvedDocuments: number;
+  backendCapReached: boolean;
+};
+
+export type SearchRetrievalOptions = {
+  /** Compact retrieval defers document bodies until candidate admission. */
+  includeBody?: boolean;
+  /** Defer context lookup until final representative selection. */
+  includeContext?: boolean;
+  /** Reports the final KNN scan of each collection target. */
+  onVectorScan?: (coverage: VectorScanCoverage) => void;
+};
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
 
   const ftsQuery = buildFTS5Query(query);
@@ -4743,7 +4733,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      ${cappedBodySql("content.doc")} as body,
+      ${retrieval?.includeBody === false ? "''" : cappedBodySql("content.doc")} as body,
+      ${retrieval?.includeBody === false ? "length(CAST(content.doc AS BLOB)) as body_length," : ""}
       d.hash,
       fm.bm25_score,
       dm.metadata_json
@@ -4772,7 +4763,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY fm.bm25_score ASC, filepath ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number; metadata_json: string | null }[];
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; body_length: number; hash: string; bm25_score: number; metadata_json: string | null }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
@@ -4788,9 +4779,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       docid: getDocid(row.hash),
       collectionName,
       modifiedAt: "",  // Not available in FTS query
-      bodyLength: row.body.length,
-      body: row.body,
-      context: getContextForFile(db, row.filepath),
+      bodyLength: retrieval?.includeBody === false ? row.body_length : row.body.length,
+      ...(retrieval?.includeBody === false ? {} : { body: row.body }),
+      context: retrieval?.includeContext === false ? null : getContextForFile(db, row.filepath),
       metadata: parseMetadataJson(row.metadata_json),
       score,
       source: "fts" as const,
@@ -4813,6 +4804,7 @@ interface VecMatch {
 /** One KNN scan target: a collection's partition, or the whole table when no scope is given. */
 interface VecScanTarget {
   collectionId?: number;
+  collectionName?: string;
 }
 
 /** The document behind a vector match, at its nearest chunk. */
@@ -4820,6 +4812,7 @@ interface VecDocumentMatch {
   rowid: number;
   hash: string;
   pos: number;
+  seq: number;
   filepath: string;
   display_path: string;
   title: string;
@@ -4925,6 +4918,7 @@ function vecDocumentResolver(db: Database, filter?: MetadataFilter): (matches: r
       vr.id AS rowid,
       cv.hash,
       cv.pos,
+      cv.seq,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
@@ -4964,25 +4958,39 @@ function nearestVecDocuments(
   queryVec: Float32Array,
   limit: number,
   target: VecScanTarget,
+  onScan?: (coverage: VectorScanCoverage) => void,
 ): VecDocumentMatch[] {
   for (let k = limit * 3; ; k *= 2) {
     const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
     const matches = scan(queryVec, vecK, target);
     const documents = resolve(matches);
-    if (documents.length >= limit || matches.length < vecK || vecK === SQLITE_VEC_MAX_K) return documents;
+    if (documents.length >= limit || matches.length < vecK || vecK === SQLITE_VEC_MAX_K) {
+      onScan?.({
+        collectionId: target.collectionId ?? null,
+        collectionName: target.collectionName ?? null,
+        requestedK: vecK,
+        matchedChunks: matches.length,
+        resolvedDocuments: documents.length,
+        backendCapReached: vecK === SQLITE_VEC_MAX_K && matches.length === vecK,
+      });
+      return documents;
+    }
   }
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
 
   const names = scopedCollectionNames(collectionName);
+  const collectionNamesById = new Map<number, string>();
   let collectionIds: number[] | undefined;
   if (names) {
-    collectionIds = Array.from(resolveCollectionIds(db, names).values());
+    const ids = resolveCollectionIds(db, names);
+    collectionIds = Array.from(ids.values());
+    for (const [name, id] of ids) collectionNamesById.set(id, name);
     if (collectionIds.length === 0) return [];
   }
   const eligible = filter ? metadataEligibleCollections(db, filter) : undefined;
@@ -4998,26 +5006,30 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // value only because SQLite runs vec0's filter once per value, which is a
   // planner detail rather than a vec0 contract.
   const scanned = collectionIds && eligible ? collectionIds.filter(id => eligible.has(id)) : collectionIds;
-  const scanTargets: VecScanTarget[] = scanned ? scanned.map(collectionId => ({ collectionId })) : eligible?.size === 0 ? [] : [{}];
+  const scanTargets: VecScanTarget[] = scanned
+    ? scanned.map(collectionId => ({ collectionId, collectionName: collectionNamesById.get(collectionId) }))
+    : eligible?.size === 0 ? [] : [{}];
   if (scanTargets.length === 0) return [];
   const scan = knnVecScanner(db, collectionIds !== undefined, filter);
   const resolve = vecDocumentResolver(db, filter);
   const queryVec = new Float32Array(embedding);
   // Bodies are capped at BODY_CAP_CHARS, as in searchFTS, so a large document cannot
   // put its whole text on the heap for each result.
-  const bodyOf = db.prepare(`SELECT ${cappedBodySql("doc")} AS doc FROM content WHERE hash = ?`);
+  const bodyOf = db.prepare(retrieval?.includeBody === false
+    ? "SELECT '' AS doc, length(CAST(doc AS BLOB)) AS body_length FROM content WHERE hash = ?"
+    : `SELECT ${cappedBodySql("doc")} AS doc FROM content WHERE hash = ?`);
 
   // Each target yields its own nearest `limit` documents (or all it holds), so
   // merging them by distance gives the scope's exact nearest `limit`. Ties go
   // to the smaller filepath, as in searchFTS.
   return scanTargets
-    .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target))
+    .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target, retrieval?.onVectorScan))
     .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
     .slice(0, limit)
     .flatMap((row): SearchResult[] => {
       // The body is read after resolution, outside its snapshot: another
       // process's orphaned-content cleanup can delete the row in between.
-      const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
+      const content = bodyOf.get(row.hash) as { doc: string; body_length: number } | null | undefined;
       if (content == null) return [];
       const body = content.doc;
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
@@ -5029,13 +5041,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
         docid: getDocid(row.hash),
         collectionName,
         modifiedAt: "",  // Not available in vec query
-        bodyLength: body.length,
-        body,
-        context: getContextForFile(db, row.filepath),
+        bodyLength: retrieval?.includeBody === false ? content.body_length : body.length,
+        ...(retrieval?.includeBody === false ? {} : { body }),
+        context: retrieval?.includeContext === false ? null : getContextForFile(db, row.filepath),
         metadata: parseMetadataJson(row.metadata_json),
         score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
+        ...(retrieval?.includeBody === false ? { chunkSeq: row.seq } : {}),
       }];
     });
 }
@@ -5058,7 +5071,7 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Returns hash, document body, and a sample path for display purposes.
  */
 export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = getIndexEmbeddingFingerprint(db, model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
     SELECT d.hash, ${cappedBodySql("c.doc")} as body, MIN(d.path) as path
@@ -5071,12 +5084,18 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
       GROUP BY hash, model, embed_fingerprint
     ) v ON d.hash = v.hash
     WHERE d.active = 1
-      AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+      AND (
+        v.hash IS NULL OR v.chunk_count < v.expected_chunks
+        OR EXISTS (
+          SELECT 1 FROM content_vectors stale
+          WHERE stale.hash = d.hash AND (stale.model != ? OR stale.embed_fingerprint != ?)
+        )
+      )
     GROUP BY d.hash
   `);
     // Large-result query (up to 9k): use iterate() to stream, bound heap
     const results: { hash: string; body: string; path: string }[] = [];
-    for (const row of stmt.iterate(model, fingerprint) as IterableIterator<{ hash: string; body: string; path: string }>) {
+    for (const row of stmt.iterate(model, fingerprint, model, fingerprint) as IterableIterator<{ hash: string; body: string; path: string }>) {
       results.push(row);
     }
     return results;
@@ -5210,7 +5229,7 @@ export function insertEmbedding(
   model: string,
   embeddedAt: string,
   totalChunks: number = 1,
-  fingerprint: string = getEmbeddingFingerprint(model)
+  fingerprint: string = getIndexEmbeddingFingerprint(db, model)
 ): void {
   withLazyContentVectorMigration(db, () => {
     db.transaction(() => {
@@ -5223,19 +5242,53 @@ export function insertEmbedding(
   });
 }
 
-function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
+/**
+ * Settle every hash a batch attempted. PRIMARY KEY (hash, seq) holds one
+ * layout per hash, so each decision covers the whole hash, in one transaction:
+ *
+ * | current (model, fingerprint) rows | action |
+ * |---|---|
+ * | complete sequence 0..n-1 | retire every other row of the hash with its partition vectors |
+ * | partial | remove every row of the hash with its partition vectors; the hash stays pending |
+ * | none | keep the hash as it is; it stays pending |
+ *
+ * Returns the removed current rows this run wrote, so retired older rows
+ * never reduce the embedded-chunk count.
+ */
+function settleAttemptedEmbeddings(
+  db: Database,
+  expectedChunksByHash: Map<string, number>,
+  model: string,
+  fingerprint: string,
+  writtenByHash: ReadonlyMap<string, number>,
+): number {
   return withLazyContentVectorMigration(db, () => {
     let removed = 0;
-    const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
-    const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND model = ?`);
+    const rowsStmt = db.prepare(`SELECT seq, (model = ? AND embed_fingerprint = ?) AS current FROM content_vectors WHERE hash = ?`);
+    const deleteRowStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND seq = ?`);
+    const partitionIdsStmt = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = ?`);
+    const deleteHashStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ?`);
 
     for (const [hash, expectedChunks] of expectedChunksByHash) {
-      const rows = rowsStmt.all(hash, model) as { seq: number }[];
-      if (rows.length === 0 || rows.length === expectedChunks) continue;
-
-      deletePartitionRowsOfHash(db, hash);
-      deleteContentStmt.run(hash, model);
-      removed += rows.length;
+      db.transaction(() => {
+        const rows = rowsStmt.all(model, fingerprint, hash) as { seq: number; current: number }[];
+        const current = rows.filter((row) => row.current);
+        if (current.length === 0) return;
+        // n distinct safe sequences in [0, n) are exactly 0..n-1; PRIMARY KEY (hash, seq) makes them distinct.
+        const complete = current.length === expectedChunks
+          && current.every((row) => Number.isSafeInteger(row.seq) && row.seq >= 0 && row.seq < expectedChunks);
+        if (complete) {
+          for (const { seq } of rows.filter((row) => !row.current)) {
+            const ids = partitionIdsStmt.all(hash, seq) as { id: number }[];
+            deletePartitionRows(db, ids.map((row) => row.id));
+            deleteRowStmt.run(hash, seq);
+          }
+          return;
+        }
+        deletePartitionRowsOfHash(db, hash);
+        deleteHashStmt.run(hash);
+        removed += writtenByHash.get(hash) ?? 0;
+      }).immediate();
     }
 
     return removed;
@@ -5316,9 +5369,13 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
+export function formatRerankQuery(query: string, intent?: string): string {
+  return intent ? `${intent}\n\n${query}` : query;
+}
+
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
-  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+  const rerankQuery = formatRerankQuery(query, intent);
   const llm = llmOverride ?? getDefaultLlamaCpp();
   // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
   // reuse another model's cache entries (#764).
@@ -5335,7 +5392,8 @@ export async function rerank(query: string, documents: { file: string; text: str
   for (const doc of documents) {
     const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text });
     const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: cacheModel, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
+    const cached = getCachedResult(db, cacheKey)
+      ?? (rerankQuery === query ? getCachedResult(db, legacyCacheKey) : null);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
     } else {
@@ -5368,12 +5426,30 @@ export async function rerank(query: string, documents: { file: string; text: str
 // Reciprocal Rank Fusion
 // =============================================================================
 
-export function reciprocalRankFusion(
-  resultLists: RankedResult[][],
+const DEFAULT_RRF_K = 60;
+
+export function rrfContribution(rank: number, weight: number, k: number = DEFAULT_RRF_K): number {
+  return weight / (k + rank);
+}
+
+export function rrfTopRankBonus(rank: number): number {
+  if (rank === 1) return 0.05;
+  if (rank <= 3) return 0.02;
+  return 0;
+}
+
+export function rrfPositionWeight(rank: number): number {
+  if (rank <= 3) return 0.75;
+  if (rank <= 10) return 0.60;
+  return 0.40;
+}
+
+export function reciprocalRankFusion<T extends { file: string; score: number }>(
+  resultLists: T[][],
   weights: number[] = [],
-  k: number = 60
-): RankedResult[] {
-  const scores = new Map<string, { result: RankedResult; rrfScore: number; topRank: number }>();
+  k: number = DEFAULT_RRF_K
+): T[] {
+  const scores = new Map<string, { result: T; rrfScore: number; topRank: number }>();
 
   for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
     const list = resultLists[listIdx];
@@ -5383,16 +5459,16 @@ export function reciprocalRankFusion(
     for (let rank = 0; rank < list.length; rank++) {
       const result = list[rank];
       if (!result) continue;
-      const rrfContribution = weight / (k + rank + 1);
+      const contribution = rrfContribution(rank + 1, weight, k);
       const existing = scores.get(result.file);
 
       if (existing) {
-        existing.rrfScore += rrfContribution;
+        existing.rrfScore += contribution;
         existing.topRank = Math.min(existing.topRank, rank);
       } else {
         scores.set(result.file, {
           result,
-          rrfScore: rrfContribution,
+          rrfScore: contribution,
           topRank: rank,
         });
       }
@@ -5401,11 +5477,7 @@ export function reciprocalRankFusion(
 
   // Top-rank bonus
   for (const entry of scores.values()) {
-    if (entry.topRank === 0) {
-      entry.rrfScore += 0.05;
-    } else if (entry.topRank <= 2) {
-      entry.rrfScore += 0.02;
-    }
+    entry.rrfScore += rrfTopRankBonus(entry.topRank + 1);
   }
 
   return Array.from(scores.values())
@@ -5420,7 +5492,7 @@ export function buildRrfTrace(
   resultLists: RankedResult[][],
   weights: number[] = [],
   listMeta: RankedListMeta[] = [],
-  k: number = 60
+  k: number = DEFAULT_RRF_K
 ): Map<string, RRFScoreTrace> {
   const traces = new Map<string, RRFScoreTrace>();
 
@@ -5438,7 +5510,7 @@ export function buildRrfTrace(
       const result = list[rank0];
       if (!result) continue;
       const rank = rank0 + 1; // 1-indexed rank for explain output
-      const contribution = weight / (k + rank);
+      const contribution = rrfContribution(rank, weight, k);
       const existing = traces.get(result.file);
 
       const detail: RRFContributionTrace = {
@@ -5469,9 +5541,7 @@ export function buildRrfTrace(
   }
 
   for (const trace of traces.values()) {
-    let bonus = 0;
-    if (trace.topRank === 1) bonus = 0.05;
-    else if (trace.topRank <= 3) bonus = 0.02;
+    const bonus = rrfTopRankBonus(trace.topRank);
     trace.topRankBonus = bonus;
     trace.totalScore = trace.baseScore + bonus;
   }
@@ -6027,6 +6097,27 @@ export const INTENT_WEIGHT_SNIPPET = 0.3;
 /** Weight for intent terms relative to query terms (1.0) in chunk selection */
 export const INTENT_WEIGHT_CHUNK = 0.5;
 
+export function selectBestChunkIndex(
+  chunks: readonly { text: string }[],
+  queryTerms: readonly string[],
+  intentTerms: readonly string[],
+): number {
+  let bestIndex = 0;
+  let bestScore = -1;
+  for (const [index, chunk] of chunks.entries()) {
+    const text = chunk.text.toLowerCase();
+    let score = queryTerms.reduce((sum, term) => sum + (text.includes(term) ? 1 : 0), 0);
+    for (const term of intentTerms) {
+      if (text.includes(term)) score += INTENT_WEIGHT_CHUNK;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
 // Common stop words filtered from intent strings before tokenization.
 // Seeded from finetune/reward.py KEY_TERM_STOPWORDS, extended with common
 // 2-3 char function words so the length threshold can drop to >1 and let
@@ -6248,6 +6339,12 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
 
+export function primaryQueryFor(queries: readonly ExpandedQuery[]): string {
+  return queries.find(query => query.type === "lex")?.query
+    || queries.find(query => query.type === "vec")?.query
+    || queries[0]?.query || "";
+}
+
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
  *
@@ -6416,16 +6513,7 @@ export async function hybridQuery(
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
+    const bestIdx = selectBestChunkIndex(chunks, queryTerms, intentTerms);
 
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
@@ -6504,10 +6592,7 @@ export async function hybridQuery(
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
+    const rrfWeight = rrfPositionWeight(rrfRank);
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
@@ -6797,9 +6882,7 @@ export async function structuredSearch(
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
   // Use first lex query as the "query" for keyword matching, or first vec if no lex
-  const primaryQuery = searches.find(s => s.type === 'lex')?.query
-    || searches.find(s => s.type === 'vec')?.query
-    || searches[0]?.query || "";
+  const primaryQuery = primaryQueryFor(searches);
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
@@ -6811,16 +6894,7 @@ export async function structuredSearch(
 
     // Pick chunk with most keyword overlap
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
+    const bestIdx = selectBestChunkIndex(chunks, queryTerms, intentTerms);
 
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
@@ -6898,10 +6972,7 @@ export async function structuredSearch(
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
+    const rrfWeight = rrfPositionWeight(rrfRank);
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 

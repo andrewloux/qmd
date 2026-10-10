@@ -1,5 +1,5 @@
 /**
- * QMD Metadata - Public metadata types and frontmatter extraction.
+ * QMD Metadata - Public metadata types, frontmatter extraction, and SDK metadata sources.
  *
  * Documents opt into metadata through a namespaced Markdown frontmatter block:
  *
@@ -12,9 +12,9 @@
  *       status: published
  *   ---
  *
- * Extraction is source-agnostic at the persistence boundary: this module
- * produces a canonical `MetadataExtractionResult`, and future non-frontmatter
- * sources can produce the same shape without touching storage or filtering.
+ * Frontmatter extraction and SDK metadata normalization produce a canonical
+ * `MetadataExtractionResult`. Storage records each row's origin; filtering
+ * reads both origins.
  *
  * The raw document is never modified — frontmatter stays part of the stored,
  * indexed, chunked, and embedded content.
@@ -43,15 +43,29 @@ export type DocumentMetadata = Record<string, MetadataValue>;
 /**
  * Result of extracting metadata from one document.
  *
- * `error` is set when the document opted into `qmd.metadata` but the value was
- * invalid — the document still indexes normally, but it is excluded from
- * filtered search until the metadata is corrected and re-indexed.
+ * Invalid `qmd.metadata` frontmatter or an invalid SDK metadata source answer
+ * sets `error`. The document indexes with empty metadata and stays out of
+ * filtered search until a subsequent update extracts valid metadata.
  */
 export interface MetadataExtractionResult {
   metadata: DocumentMetadata;
   error?: string;
   extractionVersion: number;
 }
+
+/**
+ * Supplies one document's complete metadata during `update()`, in place of
+ * its `qmd.metadata` frontmatter. QMD calls it synchronously for every
+ * nonblank file the scan admits, unchanged files included, with the path and
+ * content hash the scan already holds. `{}` clears the document's metadata.
+ */
+export type DocumentMetadataSource = (document: {
+  collection: string;
+  /** Normalized, collection-relative document path. */
+  path: string;
+  /** QMD content hash of the indexed text (`documents.hash`). */
+  hash: string;
+}) => DocumentMetadata;
 
 // =============================================================================
 // Limits
@@ -159,6 +173,96 @@ function getFrontmatterYaml(content: string): string | null {
   if (!closeMatch || closeMatch.index === undefined) return null;
 
   return body.slice(yamlStart, yamlStart + closeMatch.index);
+}
+
+// =============================================================================
+// Metadata sources
+// =============================================================================
+
+/**
+ * Ask a metadata source for one document's metadata. A throwing source or a
+ * thenable answer rejects the scan, because an error row would replace the
+ * document's last good metadata. Every other answer is normalized.
+ */
+export function askMetadataSource(
+  source: DocumentMetadataSource,
+  document: Parameters<DocumentMetadataSource>[0],
+): MetadataExtractionResult {
+  const { collection, path, hash } = document;
+  let answer: unknown;
+  try {
+    answer = source({ collection, path, hash });
+  } catch (cause) {
+    throw new Error(`Metadata source failed for ${collection}/${path}: ${describeCause(cause)}`, { cause });
+  }
+  if (isThenable(answer)) {
+    // The abandoned promise may reject later; a handler keeps that rejection
+    // from surfacing as an unhandled rejection.
+    try {
+      Promise.resolve(answer).catch(() => {});
+    } catch {}
+    throw new TypeError(
+      `Metadata source returned a thenable for ${collection}/${path}. DocumentMetadataSource must return metadata synchronously.`,
+    );
+  }
+  return normalizeSourceMetadata(answer);
+}
+
+/**
+ * Normalize one metadata source answer under the frontmatter limits, plus a
+ * `maxFrontmatterBytes` bound on the canonical JSON that QMD persists. Never
+ * throws: an answer that is not a plain object, or that normalization
+ * rejects, yields empty metadata plus a bounded error.
+ */
+export function normalizeSourceMetadata(answer: unknown): MetadataExtractionResult {
+  try {
+    if (!isPlainRecord(answer)) {
+      throw new Error(`expected a plain object, received ${describeAnswerKind(answer)}`);
+    }
+    const metadata = normalizeMetadata(answer);
+    if (Buffer.byteLength(JSON.stringify(metadata), "utf-8") > METADATA_LIMITS.maxFrontmatterBytes) {
+      throw new Error(`metadata JSON exceeds ${METADATA_LIMITS.maxFrontmatterBytes} bytes`);
+    }
+    return { metadata, extractionVersion: METADATA_EXTRACTION_VERSION };
+  } catch (err) {
+    return {
+      metadata: {},
+      error: truncateErrorMessage(`metadata source: ${describeCause(err)}`),
+      extractionVersion: METADATA_EXTRACTION_VERSION,
+    };
+  }
+}
+
+function isThenable(value: unknown): boolean {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") return false;
+  try {
+    return typeof (value as { then?: unknown }).then === "function";
+  } catch {
+    return false;
+  }
+}
+
+/** Prototype `Object.prototype` or null. A Map or a Date answer is invalid: `Object.keys` would read it as `{}`. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (!isPlainObject(value)) return false;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function describeAnswerKind(answer: unknown): string {
+  if (answer === null) return "null";
+  if (Array.isArray(answer)) return "array";
+  if (typeof answer !== "object") return typeof answer;
+  const constructorName: unknown = Object.getPrototypeOf(answer)?.constructor?.name;
+  return typeof constructorName === "string" && constructorName ? constructorName : "object";
+}
+
+function describeCause(cause: unknown): string {
+  try {
+    return cause instanceof Error ? cause.message : String(cause);
+  } catch {
+    return "unprintable error";
+  }
 }
 
 // =============================================================================

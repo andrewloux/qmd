@@ -69,8 +69,11 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import { searchCandidates, type CandidateSearchOptions, type CandidateSearchResult } from "./candidate-search.js";
+import type { VectorIndexInspection } from "./vector-inspection.js";
 import type {
   DocumentMetadata,
+  DocumentMetadataSource,
   MetadataScalar,
   MetadataScalarArray,
   MetadataValue,
@@ -118,6 +121,23 @@ import {
 } from "./collections.js";
 
 // Re-export types for SDK consumers
+export type { VectorIndexInspection, VectorPartitionState } from "./vector-inspection.js";
+export type {
+  CandidateSearchOptions,
+  CandidateSearchResult,
+  CandidateHit,
+  CandidateGroup,
+  CandidateMatch,
+  CandidateLegCoverage,
+} from "./candidate-search.js";
+export type {
+  SearchLocation,
+  LexicalLocation,
+  DocumentLocationRef,
+  Utf16Span,
+  PassageBudget,
+  PassageWindow,
+} from "./search-locations.js";
 export type {
   DocumentResult,
   DocumentNotFound,
@@ -146,6 +166,7 @@ export type {
 // Re-export metadata and metadata-filter types shared by every search surface
 export type {
   DocumentMetadata,
+  DocumentMetadataSource,
   MetadataScalar,
   MetadataScalarArray,
   MetadataValue,
@@ -212,6 +233,12 @@ export type UpdateResult = {
   /** Vector rows copied into the partition of a collection that gained an already-embedded hash. */
   vectorsCopied: number;
   needsEmbedding: number;
+  /**
+   * Documents whose metadata failed extraction this pass: invalid
+   * `qmd.metadata` frontmatter, or an invalid `metadata` source answer. Each
+   * keeps empty metadata and stays out of filtered search.
+   */
+  metadataErrors: number;
 };
 
 /**
@@ -311,6 +338,9 @@ export interface QMDStore {
   /** Full search: query expansion + multi-signal retrieval + LLM reranking */
   search(options: SearchOptions): Promise<HybridQueryResult[]>;
 
+  /** Retrieve metadata groups with per-leg admission and coverage accounting. */
+  searchCandidates(options: CandidateSearchOptions): Promise<CandidateSearchResult>;
+
   /** BM25 keyword search (fast, no LLM) */
   searchLex(query: string, options?: LexSearchOptions): Promise<SearchResult[]>;
 
@@ -387,6 +417,18 @@ export interface QMDStore {
   update(options?: {
     collections?: string[];
     onProgress?: (info: UpdateProgress) => void;
+    /**
+     * Supplies each admitted nonblank document's complete metadata, replacing
+     * `qmd.metadata` frontmatter for this update. Unchanged files are asked
+     * too, so a metadata-only change needs no file edit.
+     *
+     * QMD applies the frontmatter limits and bounds the answer's canonical
+     * JSON at 64 KiB. An invalid answer stores empty metadata plus an error
+     * and counts in `metadataErrors`. A throw or a thenable answer rejects
+     * the update and rolls back its open write batch; earlier batches stay
+     * committed. A later update without `metadata` re-extracts frontmatter.
+     */
+    metadata?: DocumentMetadataSource;
   }): Promise<UpdateResult>;
 
   /** Generate vector embeddings for documents that need them */
@@ -398,6 +440,11 @@ export interface QMDStore {
     maxDocsPerBatch?: number;
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
+    /**
+     * Wall-clock cap in milliseconds for the whole embed session; batches left at expiry are
+     * skipped. Defaults to 30 minutes; a value <= 0 disables the cap.
+     */
+    maxDurationMs?: number;
     onProgress?: (info: EmbedProgress) => void;
   }): Promise<EmbedResult>;
 
@@ -408,6 +455,9 @@ export interface QMDStore {
 
   /** Get index health info (stale embeddings, etc.) */
   getIndexHealth(): Promise<IndexHealthInfo>;
+
+  /** Inspect recorded vector generations and partition peers in one snapshot. */
+  inspectVectorIndex(options?: { model?: string }): Promise<VectorIndexInspection>;
 
   // ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -529,6 +579,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
+    searchCandidates: opts => searchCandidates(internal, opts),
     searchLex: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
       return internal.searchFTS(q, opts?.limit, opts?.collection, filter);
@@ -604,6 +655,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Indexing — reads collections from SQLite
     update: async (updateOpts) => {
+      // One read: a getter runs once, and reassigning the option mid-update
+      // leaves every collection of this update on the same source.
+      const metadataSource = updateOpts?.metadata;
+      if (metadataSource !== undefined && typeof metadataSource !== "function") {
+        throw new TypeError(`update() metadata must be a function, received ${metadataSource === null ? "null" : typeof metadataSource}`);
+      }
+
       const collections = getStoreCollections(db);
       const filtered = updateOpts?.collections
         ? collections.filter(c => updateOpts.collections!.includes(c.name))
@@ -611,7 +669,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
       internal.clearCache();
 
-      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
+      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0, totalMetadataErrors = 0;
 
       for (const col of filtered) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
@@ -619,12 +677,14 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           onProgress: updateOpts?.onProgress
             ? (info) => updateOpts.onProgress!({ collection: col.name, ...info })
             : undefined,
+          metadataSource,
         });
         totalIndexed += result.indexed;
         totalUpdated += result.updated;
         totalUnchanged += result.unchanged;
         totalRemoved += result.removed;
         totalSkipped += result.skipped;
+        totalMetadataErrors += result.metadataErrors;
       }
 
       // A changed file rewrites its document's hash in place and strands the
@@ -646,6 +706,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         staleVectorsRemoved,
         vectorsCopied,
         needsEmbedding: internal.getHashesNeedingEmbedding(),
+        metadataErrors: totalMetadataErrors,
       };
     },
 
@@ -657,6 +718,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,
+        maxDurationMs: embedOpts?.maxDurationMs,
         onProgress: embedOpts?.onProgress,
       });
     },
@@ -664,6 +726,12 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     // Index Health
     getStatus: async () => internal.getStatus(),
     getIndexHealth: async () => internal.getIndexHealth(),
+    inspectVectorIndex: async (opts) => {
+      if (opts?.model !== undefined && (typeof opts.model !== "string" || !opts.model.trim())) {
+        throw new Error("model must be a non-empty string");
+      }
+      return internal.inspectVectorIndex(opts?.model);
+    },
 
     // Lifecycle
     close: async () => {
