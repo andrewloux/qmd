@@ -8,6 +8,7 @@ import {
   type QMDStore,
 } from "../src/index.js";
 import {
+  chunkDocumentByTokens,
   hashContent,
   searchVec,
   type CollectionScope,
@@ -15,6 +16,7 @@ import {
   type SearchRetrievalOptions,
   type Store,
 } from "../src/store.js";
+import { LlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import { replaceDocumentMetadata } from "../src/metadata-store.js";
 import { METADATA_EXTRACTION_VERSION } from "../src/metadata.js";
 
@@ -45,6 +47,7 @@ let sdk: QMDStore;
 let store: Store;
 const documents = new Map<string, StoredDocument>();
 const retrievalCalls: RetrievalCall[] = [];
+let recutChunks: { text: string; pos: number }[] = [];
 
 beforeAll(async () => {
   testDir = await mkdtemp(join(tmpdir(), "qmd-candidate-locations-"));
@@ -55,6 +58,7 @@ beforeAll(async () => {
     "siblings",
     "rerank",
     "parity",
+    "recut",
   ] as const;
   const collections = Object.fromEntries(names.map(name => [
     name,
@@ -75,6 +79,7 @@ beforeAll(async () => {
   await seedSiblingDocuments();
   await seedRerankDocument();
   await seedParityDocument();
+  await seedRecutDocument();
   installFaithfulRetrievalWrappers();
 });
 
@@ -232,6 +237,40 @@ async function seedParityDocument(): Promise<void> {
     "paritymarker stable ordinary search body",
     "parity",
   );
+}
+
+/** 1.2 characters per token: QMD's token chunker re-cuts each 2,700-character first-pass chunk. */
+class RecutTokenizer extends LlamaCpp {
+  override async tokenize(text: string): ReturnType<LlamaCpp["tokenize"]> {
+    return new Array(Math.ceil(text.length * 5 / 6)).fill(1);
+  }
+}
+
+/**
+ * Stores the token chunker's own layout for one 6,000-character line. Chunk 4
+ * starts at 2,295, before chunk 3 at 2,349, and alone matches the query vector.
+ */
+async function seedRecutDocument(): Promise<void> {
+  const body = Array.from({ length: 1_200 }, (_, index) => `w${String(index).padStart(4, "0")}`).join("");
+  setDefaultLlamaCpp(new RecutTokenizer());
+  try {
+    recutChunks = await chunkDocumentByTokens(body);
+  } finally {
+    setDefaultLlamaCpp(null);
+  }
+  const document = await insertDocument("recut", "recut", "recut.md", "Recut source", body, "recut");
+  const now = new Date().toISOString();
+  for (const [seq, chunk] of recutChunks.entries()) {
+    store.insertEmbedding(
+      document.hash,
+      seq,
+      chunk.pos,
+      new Float32Array(seq === 4 ? [1, 0] : [0, 1]),
+      MODEL,
+      now,
+      recutChunks.length,
+    );
+  }
 }
 
 function queryVector(query: string): number[] {
@@ -404,6 +443,34 @@ describe("representative source anchors", () => {
     });
     expect(hit.passage?.text).toContain("late vector marker");
     expect(hit.passage?.utf8Bytes).toBeLessThanOrEqual(100);
+  });
+
+  test("anchors a re-cut vector chunk that starts before its predecessor", async () => {
+    const source = documents.get("recut")!;
+    const chunk = recutChunks[4]!;
+    const result = await sdk.searchCandidates(candidateOptions(
+      "recut",
+      [{ type: "vec", query: "recut" }],
+      { locations: true, passage: { maxUtf8Bytes: 64 } },
+    ));
+    const hit = singleResult(result);
+    const passage = hit.passage!;
+
+    expect(recutChunks.map(recut => recut.pos).slice(3, 5)).toEqual([2_349, 2_295]);
+    expect(source.body.slice(chunk.pos, chunk.pos + chunk.text.length)).toBe(chunk.text);
+    expect(hit.bodyAnchorStatus).toBe("located");
+    expect(hit.matches[0]).toMatchObject({ vectorStartUtf16: 2_295, vectorChunkSeq: 4 });
+    expect(hit.locations?.find(location => location.kind === "vector_chunk_start")).toEqual({
+      kind: "vector_chunk_start",
+      uri: source.uri,
+      contentHash: source.hash,
+      startUtf16: 2_295,
+      endUtf16: null,
+      chunkSeq: 4,
+    });
+    expect(source.body.slice(passage.startUtf16, passage.endUtf16)).toBe(passage.text);
+    expect(passage).toMatchObject({ startUtf16: 2_263, endUtf16: 2_327, utf8Bytes: 64 });
+    expect(chunk.text.startsWith(source.body.slice(2_295, passage.endUtf16))).toBe(true);
   });
 
   test("identifies the representative leg when one file has lexical and vector anchors", async () => {

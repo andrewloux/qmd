@@ -95,8 +95,7 @@ function countInconsistentChunkLayouts(
       SELECT
         cv.hash,
         cv.seq,
-        cv.pos,
-        LAG(cv.pos) OVER (PARTITION BY cv.hash ORDER BY cv.seq) AS previous_pos
+        cv.pos
       FROM content_vectors cv
       JOIN active_hashes ah ON ah.hash = cv.hash
       WHERE cv.model = ? AND cv.embed_fingerprint = ?
@@ -120,7 +119,6 @@ function countInconsistentChunkLayouts(
           OR pos < 0
           OR pos > 9007199254740991
           OR (seq = 0 AND pos != 0)
-          OR (seq > 0 AND (previous_pos IS NULL OR pos <= previous_pos))
         THEN 1 ELSE 0 END) AS invalid_positions
       FROM selected_chunks
       GROUP BY hash

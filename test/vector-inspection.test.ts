@@ -7,10 +7,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../src/db.js";
-import { LlamaCpp, type EmbeddingResult } from "../src/llm.js";
+import { LlamaCpp, setDefaultLlamaCpp, type EmbeddingResult } from "../src/llm.js";
 import {
+  chunkDocumentByTokens,
   createStore,
   deactivateDocument,
+  extractTitle,
+  formatDocForEmbedding,
   generateEmbeddings,
   getEmbeddingFingerprint,
   insertContent,
@@ -46,9 +49,15 @@ afterEach(async () => {
   dir = null;
 });
 
-function seedDocument(s: Store, collection: string, hash: string, path: string): void {
+function seedDocument(
+  s: Store,
+  collection: string,
+  hash: string,
+  path: string,
+  body: string = `# ${hash}\n\nBody for ${hash}.`,
+): void {
   const now = new Date().toISOString();
-  insertContent(s.db, hash, `# ${hash}\n\nBody for ${hash}.`, now);
+  insertContent(s.db, hash, body, now);
   insertDocument(s.db, collection, path, hash, hash, now, now);
 }
 
@@ -97,6 +106,52 @@ class FixedEmbeddingLlm extends LlamaCpp {
   override async embedBatch(texts: string[]): Promise<EmbeddingResult[]> {
     return texts.map(() => ({ embedding: [0.1, 0.2, 0.3], model: MODEL }));
   }
+}
+
+/** One line of 6,000 characters: the first token pass starts chunks at 0, 2,295 and 4,590. */
+const RECUT_BODY = Array.from({ length: 1_200 }, (_, index) => `w${String(index).padStart(4, "0")}`).join("");
+
+/**
+ * Counts `tokensPerChar` tokens per character, so each 2,700-character
+ * first-pass chunk exceeds 900 tokens and the chunker re-cuts it.
+ */
+class RecutTokenLlm extends FixedEmbeddingLlm {
+  readonly tokensPerChar: number;
+  readonly embeddedTexts: string[] = [];
+
+  constructor(tokensPerChar: number) {
+    super();
+    this.tokensPerChar = tokensPerChar;
+  }
+
+  override async tokenize(text: string): ReturnType<LlamaCpp["tokenize"]> {
+    return new Array(Math.ceil(text.length * this.tokensPerChar)).fill(1);
+  }
+
+  override async embedBatch(texts: string[]): Promise<EmbeddingResult[]> {
+    this.embeddedTexts.push(...texts);
+    return super.embedBatch(texts);
+  }
+}
+
+async function chunkRecutBody(tokensPerChar: number) {
+  setDefaultLlamaCpp(new RecutTokenLlm(tokensPerChar));
+  try {
+    return await chunkDocumentByTokens(RECUT_BODY);
+  } finally {
+    setDefaultLlamaCpp(null);
+  }
+}
+
+type StoredChunk = { seq: number; pos: number; total: number };
+
+function storedChunks(s: Store, hash: string): StoredChunk[] {
+  return s.db.prepare(`
+    SELECT seq, pos, total_chunks AS total
+    FROM content_vectors
+    WHERE hash = ?
+    ORDER BY seq
+  `).all(hash) as StoredChunk[];
 }
 
 describe("inspectVectorIndex", () => {
@@ -363,15 +418,86 @@ describe("inspectVectorIndex", () => {
       s.insertEmbedding(hash, 0, pos, new Float32Array([1, 2, 3]), MODEL, now, 1, fingerprint);
     }
 
-    seedDocument(s, "docs", "nonmonotone-pos", "nonmonotone-pos.md");
-    s.insertEmbedding("nonmonotone-pos", 0, 0, new Float32Array([1, 2, 3]), MODEL, now, 2, fingerprint);
-    s.insertEmbedding("nonmonotone-pos", 1, 0, new Float32Array([1, 2, 3]), MODEL, now, 2, fingerprint);
-
     expect(s.getHashesNeedingEmbedding(MODEL)).toBe(0);
     expect(inspectStore(s)).toMatchObject({
       needsEmbedding: 0,
-      inconsistentChunkLayouts: 5,
-      requiredPartitionRows: 6,
+      inconsistentChunkLayouts: 4,
+      requiredPartitionRows: 4,
+      missingRequiredPartitionRows: 0,
+      inconsistentPeerRows: 0,
+      structurallyReady: false,
+    });
+  });
+
+  for (const { layout, tokensPerChar, starts } of [
+    {
+      layout: "a later chunk starts before its predecessor",
+      tokensPerChar: 5 / 6,
+      starts: [0, 783, 1_566, 2_349, 2_295, 3_078, 3_861, 4_644, 4_590, 5_373],
+    },
+    {
+      layout: "two chunks share a start",
+      tokensPerChar: 2_303 / 2_700,
+      starts: [0, 765, 1_530, 2_295, 2_295, 3_060, 3_825, 4_590, 4_590, 5_355],
+    },
+  ]) {
+    test(`accepts the token chunker's re-cut layout where ${layout}`, async () => {
+      const s = await openStore();
+      s.ensureVecTable(3);
+      seedDocument(s, "docs", "recut", "recut.md", RECUT_BODY);
+      const llm = new RecutTokenLlm(tokensPerChar);
+      s.llm = llm;
+
+      expect(await generateEmbeddings(s, { model: MODEL })).toMatchObject({ chunksEmbedded: 10, errors: 0 });
+      const chunks = await chunkRecutBody(tokensPerChar);
+      const title = extractTitle(RECUT_BODY, "recut.md");
+
+      expect(chunks.map(chunk => chunk.pos)).toEqual(starts);
+      for (const chunk of chunks) {
+        expect(RECUT_BODY.slice(chunk.pos, chunk.pos + chunk.text.length)).toBe(chunk.text);
+      }
+      expect(storedChunks(s, "recut")).toEqual(chunks.map((chunk, seq) => ({ seq, pos: chunk.pos, total: 10 })));
+      expect(llm.embeddedTexts).toEqual(chunks.map(chunk => formatDocForEmbedding(chunk.text, title, MODEL)));
+      expect(inspectStore(s)).toMatchObject({
+        needsEmbedding: 0,
+        inconsistentChunkLayouts: 0,
+        requiredPartitionRows: 10,
+        missingRequiredPartitionRows: 0,
+        inconsistentPeerRows: 0,
+        structurallyReady: true,
+      });
+    });
+  }
+
+  test("reports malformed copies of a re-cut layout as inconsistent", async () => {
+    const s = await openStore();
+    s.ensureVecTable(3);
+    seedDocument(s, "docs", "recut", "recut.md", RECUT_BODY);
+    s.llm = new RecutTokenLlm(5 / 6);
+    await generateEmbeddings(s, { model: MODEL });
+    const layout = storedChunks(s, "recut");
+    const now = new Date().toISOString();
+    const fingerprint = getEmbeddingFingerprint(MODEL);
+
+    const malformedCopies: Record<string, (chunk: StoredChunk) => StoredChunk> = {
+      "sequence-from-one": chunk => ({ ...chunk, seq: chunk.seq + 1 }),
+      "first-start-moved": chunk => (chunk.seq === 0 ? { ...chunk, pos: 1 } : chunk),
+      "negative-start": chunk => (chunk.seq === 4 ? { ...chunk, pos: -1 } : chunk),
+      "split-total": chunk => (chunk.seq === 4 ? { ...chunk, total: 9 } : chunk),
+    };
+    for (const [hash, malform] of Object.entries(malformedCopies)) {
+      seedDocument(s, "docs", hash, `${hash}.md`, RECUT_BODY);
+      for (const { seq, pos, total } of layout.map(malform)) {
+        s.insertEmbedding(hash, seq, pos, new Float32Array([1, 2, 3]), MODEL, now, total, fingerprint);
+      }
+    }
+
+    expect(layout.map(chunk => chunk.pos).slice(3, 5)).toEqual([2_349, 2_295]);
+    expect(s.getHashesNeedingEmbedding(MODEL)).toBe(0);
+    expect(inspectStore(s)).toMatchObject({
+      needsEmbedding: 0,
+      inconsistentChunkLayouts: 4,
+      requiredPartitionRows: 50,
       missingRequiredPartitionRows: 0,
       inconsistentPeerRows: 0,
       structurallyReady: false,
