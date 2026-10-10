@@ -1,4 +1,4 @@
-import { createStore } from "../../src/store.js";
+import { chunkDocumentByTokens, createStore } from "../../src/store.js";
 import { checkEmbeddingVectorSamples } from "../../src/cli/qmd.js";
 import { LlamaCpp, setDefaultLlamaCpp } from "../../src/llm.js";
 import { heapLimitBinds } from "./heap-limit.js";
@@ -14,6 +14,7 @@ const store = createStore(":memory:");
 try {
   setDefaultLlamaCpp(new ConstantLlm());
   const body = "word ".repeat(13_107); // About 64 KiB per document.
+  const chunks = await chunkDocumentByTokens(body);
   store.ensureVecTable(2);
   store.db.transaction(() => {
     for (let doc = 0; doc < 16; doc++) {
@@ -22,8 +23,8 @@ try {
       for (let path = 0; path < 8; path++) {
         store.insertDocument("test", `${hash}-${path}.md`, hash, hash, "2026-01-01", "2026-01-01");
       }
-      for (let seq = 0; seq < 32; seq++) {
-        store.insertEmbedding(hash, seq, 0, new Float32Array([1, 0]), "model", "2026-01-01", 32, "current");
+      for (let seq = 0; seq < chunks.length; seq++) {
+        store.insertEmbedding(hash, seq, chunks[seq]!.pos, new Float32Array([1, 0]), "model", "2026-01-01", chunks.length, "current");
       }
     }
   })();

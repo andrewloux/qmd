@@ -184,15 +184,60 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
 
-export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): string {
+/**
+ * Identity of the chunk-boundary algorithm. Bump it whenever the same input,
+ * tokenizer, options and strategy can produce different chunk boundaries. The
+ * embedding fingerprint includes it, so vectors stored under older boundaries
+ * become pending. test/embedding-fingerprint.test.ts pins its layout digest.
+ */
+export const CHUNKER_VERSION = 1;
+
+/**
+ * Identity of the vectors QMD would produce for a model and chunk strategy:
+ * model name, embedding input formats, chunk size, overlap, break-point
+ * window, chunker version and strategy. Computed from constants alone, so
+ * status and inspection need no model. Six lowercase hex digits.
+ */
+export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL, chunkStrategy: ChunkStrategy = "regex"): string {
   const significant = [
     `model:${model}`,
     `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+    `chunk_window_tokens:${CHUNK_WINDOW_TOKENS}`,
+    `chunker:${CHUNKER_VERSION}`,
+    `chunk_strategy:${validChunkStrategy(chunkStrategy, "chunkStrategy")}`,
   ].join("\n");
   return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+}
+
+/** store_config key of the index-wide chunk strategy that embedding uses. */
+const EMBEDDING_CHUNK_STRATEGY_KEY = "embedding_chunk_strategy";
+
+function validChunkStrategy(value: unknown, label: string): ChunkStrategy {
+  if (value === "regex" || value === "auto") return value;
+  throw new Error(`${label} must be "auto" or "regex" (got ${JSON.stringify(value)})`);
+}
+
+/**
+ * The index-wide chunk strategy: the one the last explicit embed recorded, or
+ * "regex" for an index with none. Vectors are stored per content hash, and one
+ * hash can sit in several collections, so the strategy belongs to the index.
+ */
+export function getEmbeddingChunkStrategy(db: Database): ChunkStrategy {
+  const row = db.prepare(`SELECT value FROM store_config WHERE key = ?`).get(EMBEDDING_CHUNK_STRATEGY_KEY) as { value: string } | null | undefined;
+  return row ? validChunkStrategy(row.value, `store_config ${EMBEDDING_CHUNK_STRATEGY_KEY}`) : "regex";
+}
+
+function setEmbeddingChunkStrategy(db: Database, chunkStrategy: ChunkStrategy): void {
+  db.prepare(`INSERT INTO store_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    .run(EMBEDDING_CHUNK_STRATEGY_KEY, chunkStrategy);
+}
+
+/** The fingerprint of the vectors this index accepts as current: the model under the stored chunk strategy. */
+export function getIndexEmbeddingFingerprint(db: Database, model: string = DEFAULT_EMBED_MODEL): string {
+  return getEmbeddingFingerprint(model, getEmbeddingChunkStrategy(db));
 }
 
 /**
@@ -2229,9 +2274,8 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
-function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+function getPendingEmbeddingDocs(db: Database, collection: string | undefined, model: string, fingerprint: string): PendingEmbeddingDoc[] {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
@@ -2326,17 +2370,24 @@ export async function generateEmbeddings(
   const db = store.db;
   const llm = getLlm(store);
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
-  const fingerprint = getEmbeddingFingerprint(model);
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
+  // An explicit strategy becomes the index-wide policy before pending work is
+  // chosen; an omitted one keeps the stored policy. An invalid explicit or
+  // stored strategy throws here, before any vector write.
+  const chunkStrategy = options?.chunkStrategy === undefined
+    ? getEmbeddingChunkStrategy(db)
+    : validChunkStrategy(options.chunkStrategy, "chunkStrategy");
+  if (options?.chunkStrategy !== undefined) setEmbeddingChunkStrategy(db, chunkStrategy);
+  const fingerprint = getEmbeddingFingerprint(model, chunkStrategy);
 
   if (options?.force) {
     clearAllEmbeddings(db, options?.collection);
   }
 
   const chunksCopied = copyVectorsToNewCollections(db, options?.collection).copied;
-  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
+  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model, fingerprint);
 
   if (docsToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, chunksCopied, errors: 0, durationMs: 0 };
@@ -2351,6 +2402,12 @@ export async function generateEmbeddings(
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
     let chunksEmbedded = 0;
+    // Current rows this run wrote, per hash: cleanup subtracts only these.
+    const writtenByHash = new Map<string, number>();
+    const countWrite = (chunk: ChunkItem) => {
+      chunksEmbedded++;
+      writtenByHash.set(chunk.hash, (writtenByHash.get(chunk.hash) ?? 0) + 1);
+    };
     let bytesProcessed = 0;
     let totalChunks = 0;
     let vectorTableInitialized = false;
@@ -2394,7 +2451,7 @@ export async function generateEmbeddings(
           return false;
         }
         insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
-        chunksEmbedded++;
+        countWrite(chunk);
         successesSinceRetry++;
         clearFailure(chunk);
         return true;
@@ -2449,7 +2506,7 @@ export async function generateEmbeddings(
           doc.body,
           undefined, undefined, undefined,
           doc.path,
-          options?.chunkStrategy,
+          chunkStrategy,
           session.signal,
         );
 
@@ -2533,7 +2590,7 @@ export async function generateEmbeddings(
             }
           }).immediate();
           for (const chunk of stored) {
-            chunksEmbedded++;
+            countWrite(chunk);
             successesSinceRetry++;
             clearFailure(chunk);
           }
@@ -2572,9 +2629,9 @@ export async function generateEmbeddings(
 
       await retryFailedChunks(true);
 
-      const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
-      if (removedPartialChunks > 0) {
-        chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
+      const removedCurrentChunks = settleAttemptedEmbeddings(db, expectedChunksByHash, model, fingerprint, writtenByHash);
+      if (removedCurrentChunks > 0) {
+        chunksEmbedded = Math.max(0, chunksEmbedded - removedCurrentChunks);
       }
 
       bytesProcessed += batchBytes;
@@ -2617,7 +2674,7 @@ export function createStore(dbPath?: string): Store {
     getIndexHealth: (model?: string) => getIndexHealth(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
     inspectVectorIndex: (model?: string) => {
       const selectedModel = model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL;
-      const embeddingFingerprint = getEmbeddingFingerprint(selectedModel);
+      const embeddingFingerprint = getIndexEmbeddingFingerprint(db, selectedModel);
       return inspectVectorIndex(
         db,
         selectedModel,
@@ -2954,9 +3011,15 @@ export function getEmbeddingVectorSamples(db: Database, model: string, fingerpri
   `).all<EmbeddingVectorSample>(model, fingerprint, sampleSize);
 }
 
-export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
+/**
+ * Active hashes without complete vectors under `chunkStrategy`, or under the
+ * stored index-wide strategy when it is omitted.
+ */
+export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL, chunkStrategy?: ChunkStrategy): number {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = chunkStrategy === undefined
+    ? getIndexEmbeddingFingerprint(db, model)
+    : getEmbeddingFingerprint(model, validChunkStrategy(chunkStrategy, "chunkStrategy"));
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT COUNT(DISTINCT d.hash) as count
@@ -2990,7 +3053,8 @@ export type LegacyFingerprintAdoptionResult = {
 
 export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
   const db = store.db;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const chunkStrategy = getEmbeddingChunkStrategy(db);
+  const fingerprint = getEmbeddingFingerprint(model, chunkStrategy);
   const legacyCount = withLazyContentVectorMigration(db, () => {
     const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(model) as { count: number };
     return row.count;
@@ -3053,7 +3117,7 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
       undefined,
       undefined,
       sample.path,
-      undefined,
+      chunkStrategy,
       session.signal,
     );
     const chunk = chunks[sample.seq];
@@ -4993,7 +5057,7 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Returns hash, document body, and a sample path for display purposes.
  */
 export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = getIndexEmbeddingFingerprint(db, model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
     SELECT d.hash, ${cappedBodySql("c.doc")} as body, MIN(d.path) as path
@@ -5145,7 +5209,7 @@ export function insertEmbedding(
   model: string,
   embeddedAt: string,
   totalChunks: number = 1,
-  fingerprint: string = getEmbeddingFingerprint(model)
+  fingerprint: string = getIndexEmbeddingFingerprint(db, model)
 ): void {
   withLazyContentVectorMigration(db, () => {
     db.transaction(() => {
@@ -5158,19 +5222,53 @@ export function insertEmbedding(
   });
 }
 
-function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
+/**
+ * Settle every hash a batch attempted. PRIMARY KEY (hash, seq) holds one
+ * layout per hash, so each decision covers the whole hash, in one transaction:
+ *
+ * | current (model, fingerprint) rows | action |
+ * |---|---|
+ * | complete sequence 0..n-1 | retire every other row of the hash with its partition vectors |
+ * | partial | remove every row of the hash with its partition vectors; the hash stays pending |
+ * | none | keep the hash as it is; it stays pending |
+ *
+ * Returns the removed current rows this run wrote, so retired older rows
+ * never reduce the embedded-chunk count.
+ */
+function settleAttemptedEmbeddings(
+  db: Database,
+  expectedChunksByHash: Map<string, number>,
+  model: string,
+  fingerprint: string,
+  writtenByHash: ReadonlyMap<string, number>,
+): number {
   return withLazyContentVectorMigration(db, () => {
     let removed = 0;
-    const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
-    const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND model = ?`);
+    const rowsStmt = db.prepare(`SELECT seq, (model = ? AND embed_fingerprint = ?) AS current FROM content_vectors WHERE hash = ?`);
+    const deleteRowStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND seq = ?`);
+    const partitionIdsStmt = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = ?`);
+    const deleteHashStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ?`);
 
     for (const [hash, expectedChunks] of expectedChunksByHash) {
-      const rows = rowsStmt.all(hash, model) as { seq: number }[];
-      if (rows.length === 0 || rows.length === expectedChunks) continue;
-
-      deletePartitionRowsOfHash(db, hash);
-      deleteContentStmt.run(hash, model);
-      removed += rows.length;
+      db.transaction(() => {
+        const rows = rowsStmt.all(model, fingerprint, hash) as { seq: number; current: number }[];
+        const current = rows.filter((row) => row.current);
+        if (current.length === 0) return;
+        // n distinct safe sequences in [0, n) are exactly 0..n-1; PRIMARY KEY (hash, seq) makes them distinct.
+        const complete = current.length === expectedChunks
+          && current.every((row) => Number.isSafeInteger(row.seq) && row.seq >= 0 && row.seq < expectedChunks);
+        if (complete) {
+          for (const { seq } of rows.filter((row) => !row.current)) {
+            const ids = partitionIdsStmt.all(hash, seq) as { id: number }[];
+            deletePartitionRows(db, ids.map((row) => row.id));
+            deleteRowStmt.run(hash, seq);
+          }
+          return;
+        }
+        deletePartitionRowsOfHash(db, hash);
+        deleteHashStmt.run(hash);
+        removed += writtenByHash.get(hash) ?? 0;
+      }).immediate();
     }
 
     return removed;

@@ -35,7 +35,8 @@ import {
   hashContent,
   extractTitle,
   formatDocForEmbedding,
-  getEmbeddingFingerprint,
+  getEmbeddingChunkStrategy,
+  getIndexEmbeddingFingerprint,
   chunkDocumentByTokens,
   clearCache,
   getCacheKey,
@@ -87,7 +88,6 @@ import {
   scanWriteBatch,
   REINDEX_MAX_FILE_SIZE,
   generateEmbeddings,
-  maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
   type ReindexResult,
   type ChunkStrategy,
@@ -2409,8 +2409,8 @@ async function vectorIndex(
     }
 
     // Check if there's work to do before starting
-    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
-    if (hashesToEmbed === 0 && !force) {
+    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model, batchOptions?.chunkStrategy);
+    if (hashesToEmbed === 0 && !force && batchOptions?.chunkStrategy === undefined) {
       console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
       closeDb();
       return;
@@ -4260,15 +4260,16 @@ export async function checkEmbeddingVectorSamples(db: Database, model: string, f
 
   const threshold = 0.0001;
   const mismatches: string[] = [];
+  const chunkStrategy = getEmbeddingChunkStrategy(db);
 
   await withLLMSession(async (session) => {
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
-      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, chunkStrategy, session.signal);
       // Sequence numbers identify stored vectors, but earlier chunks can split
       // differently after a tokenizer/chunker change. Compare the saved passage.
-      const chunk = chunks.find(chunk => chunk.pos === sample.pos);
-      if (!chunk) {
+      const chunk = chunks[sample.seq];
+      if (!chunk || chunk.pos !== sample.pos) {
         mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
         continue;
       }
@@ -4444,7 +4445,7 @@ async function showDoctor(): Promise<void> {
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
   const embedModel = activeModels.embed;
-  const fingerprint = getEmbeddingFingerprint(embedModel);
+  const fingerprint = getIndexEmbeddingFingerprint(db, embedModel);
   const nextSteps: string[] = [];
 
   console.log(`${c.bold}QMD Doctor${c.reset}\n`);
@@ -4475,15 +4476,6 @@ async function showDoctor(): Promise<void> {
   checkModelCache(activeModels, nextSteps);
 
   await runDoctorDeviceChecks(nextSteps);
-
-  try {
-    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
-    if (adoption.checked || adoption.adopted > 0) {
-      doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
-    }
-  } catch (error) {
-    doctorCheck("legacy fingerprint adoption", false, error instanceof Error ? error.message : String(error));
-  }
 
   try {
     const pending = getHashesNeedingEmbedding(db, undefined, embedModel);
