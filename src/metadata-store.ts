@@ -4,8 +4,8 @@
  *
  * Metadata attaches to document identity (`documents.id`), not content
  * identity: two paths can share one content hash while carrying different
- * metadata. SQLite stays a derived index — metadata is rebuilt from source
- * documents on `qmd update`, never mutated in place.
+ * metadata. SQLite stays a derived index: an update rebuilds metadata from
+ * document frontmatter or an SDK metadata source.
  *
  * `document_metadata` records extraction state per document (including
  * successful-but-empty extraction), so filtered search can distinguish
@@ -132,7 +132,7 @@ function hasMetadataSourceColumn(db: Database): boolean {
  * Extract and persist metadata for one document, replacing any prior rows.
  *
  * With `onlyIfStale`, extraction is skipped when the document already has a
- * current-version extraction row — the cheap path for unchanged documents
+ * current-version frontmatter extraction row — the cheap path for unchanged documents
  * during re-index. Returns the extraction result, or null when skipped.
  */
 export function syncDocumentMetadata(

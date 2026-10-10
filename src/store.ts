@@ -1721,7 +1721,7 @@ export type ReindexResult = {
   orphanedCleaned: number;
   skipped: number;
   skippedFiles: ReindexSkippedFile[];
-  /** Documents whose qmd.metadata frontmatter failed extraction this pass. */
+  /** Documents whose qmd.metadata frontmatter or metadata source answer failed extraction this pass. */
   metadataErrors: number;
 };
 
@@ -1735,7 +1735,7 @@ type FileSyncStateRow = {
   size: number;
   content_hash: string;
   document_id: number;
-  /** 1 when the document has a metadata extraction at the current version. */
+  /** 1 when the document has a frontmatter metadata extraction at the current version. */
   metadata_current: number;
 };
 
@@ -1869,7 +1869,7 @@ export function scanWriteBatch(db: Database, maxFiles: number = 500, maxMs: numb
  * Pure function — no console output, no db lifecycle management.
  *
  * Fast-path: stat mtime_ms+size against cached row to skip file read.
- * If mtime changed but content hash identical, only mtime cache is updated.
+ * If mtime changed but content hash identical, the mtime cache is updated and metadata is synced.
  * Skips >10MB and empty files, cleans sync table entry on orphan removal.
  */
 export async function reindexCollection(
@@ -2011,17 +2011,19 @@ async function reindexCollectionIn(
 
     // Fast-path: stat matches cached sync state — skip read entirely
     const cached = syncStateMap.get(path);
-    // Missing or stale metadata (an index from before the metadata schema, or
-    // an extraction-version bump) needs the content, so such a file is read and
-    // re-extracted through the hash-match branch below.
+    // Without a metadata source, missing or stale metadata (an index from
+    // before the metadata schema, an extraction-version bump, or a row from a
+    // metadata source) needs the content, so such a file is read and
+    // re-extracted through the hash-match branch below. A metadata source
+    // answers from the cached hash, so this path asks it without a read.
     if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size && (metadataSource || cached.metadata_current)) {
       if (metadataSource) syncSourceMetadata(metadataSource, cached.document_id, path, cached.content_hash);
       unchanged++;
       processed++;
       options?.onProgress?.({ file: relativeFile, current: processed, total });
       // Still need to ensure document exists (might have been deactivated externally)
-      // But we count as unchanged and avoid expensive read+hash+metadata sync.
-      // Note: metadata sync for unchanged is skipped in fast-path; if needed, disable fast-path or force re-read.
+      // The scan counts the file as unchanged and skips the read and hash.
+      // Note: frontmatter metadata sync for unchanged is skipped in fast-path; a metadata source is asked above.
       continue;
     }
 
@@ -2052,9 +2054,8 @@ async function reindexCollectionIn(
       upsertFileSyncState(db, collectionName, path, syncMtimeMs, size, hash, cached.document_id);
       unchanged++;
       processed++;
-      // Keep content in memory for metadata sync if needed? For speed, skip metadata sync on hash-match fast-path.
-      // Existing behavior for hash-same was to still do metadata backfill; we preserve it by loading documentId from cache.
-      // However we already have content here, so do metadata backfill for hash-match case.
+      // The file was read, so metadata syncs here: a metadata source is asked
+      // with the unchanged hash, and frontmatter is backfilled when missing or stale.
       const existingForMeta = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
       if (existingForMeta && metadataSource) {
         syncSourceMetadata(metadataSource, existingForMeta.id, path, hash);

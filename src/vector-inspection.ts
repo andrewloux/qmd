@@ -74,11 +74,12 @@ function countActiveDocuments(db: Database): number {
 
 /**
  * Count active hashes whose selected chunks differ from the exact sequence
- * 0..total_chunks-1, disagree on total_chunks, have invalid recorded position
- * order, or coexist with chunks from a different model/fingerprint. This
- * validates position shape without claiming that a position lies within the
- * current source body. Hashes with no vectors stay represented by the ordinary
- * needsEmbedding count.
+ * 0..total_chunks-1, disagree on total_chunks, have an invalid recorded
+ * position, or coexist with chunks from a different model/fingerprint. Each
+ * position anchors its own chunk, and token re-cutting can store a later
+ * chunk at or before an earlier one. This validates position shape without
+ * claiming that a position lies within the current source body. Hashes with
+ * no vectors stay represented by the ordinary needsEmbedding count.
  */
 function countInconsistentChunkLayouts(
   db: Database,

@@ -1,5 +1,5 @@
 /**
- * QMD Metadata - Public metadata types and frontmatter extraction.
+ * QMD Metadata - Public metadata types, frontmatter extraction, and SDK metadata sources.
  *
  * Documents opt into metadata through a namespaced Markdown frontmatter block:
  *
@@ -12,9 +12,9 @@
  *       status: published
  *   ---
  *
- * Extraction is source-agnostic at the persistence boundary: this module
- * produces a canonical `MetadataExtractionResult`, and future non-frontmatter
- * sources can produce the same shape without touching storage or filtering.
+ * Frontmatter extraction and SDK metadata normalization produce a canonical
+ * `MetadataExtractionResult`. Storage records each row's origin; filtering
+ * reads both origins.
  *
  * The raw document is never modified — frontmatter stays part of the stored,
  * indexed, chunked, and embedded content.
@@ -43,9 +43,9 @@ export type DocumentMetadata = Record<string, MetadataValue>;
 /**
  * Result of extracting metadata from one document.
  *
- * `error` is set when the document opted into `qmd.metadata` but the value was
- * invalid — the document still indexes normally, but it is excluded from
- * filtered search until the metadata is corrected and re-indexed.
+ * Invalid `qmd.metadata` frontmatter or an invalid SDK metadata source answer
+ * sets `error`. The document indexes with empty metadata and stays out of
+ * filtered search until a subsequent update extracts valid metadata.
  */
 export interface MetadataExtractionResult {
   metadata: DocumentMetadata;

@@ -39,8 +39,9 @@ The result reports:
   selected-model pending count.
 - `inconsistentChunkLayouts`: active hashes whose stored chunks disagree on
   generation, positive `total_chunks`, the exact sequence `0..N-1`, or recorded
-  position shape. Positions require safe nonnegative integers, position `0`
-  for sequence `0`, and strict increase by sequence.
+  position shape. Positions require safe nonnegative integers and position `0`
+  for sequence `0`. Each position anchors its own chunk in the source body.
+  Token re-cutting can store a later sequence at or before an earlier start.
 - `requiredPartitionRows`: selected recorded chunks multiplied by their
   distinct active content-hash/collection memberships.
 - `missingRequiredPartitionRows`: required rows with an absent or inconsistent
@@ -73,9 +74,9 @@ The following table reads top-down; the first matching row determines readiness.
 
 ## Caller-owned provenance checks
 
-QMD's fingerprint describes the model identifier, formatting, and chunking
-parameters. The ingesting application records the model-file SHA256 and
-verifies source/projection provenance. Structural readiness proves recorded
+QMD's fingerprint describes the model identifier, formatting, chunking
+parameters, chunker version, and the index's chunk strategy. The ingesting
+application records the model-file SHA256 and verifies source/projection provenance. Structural readiness proves recorded
 coverage and physical consistency. Semantic vector/content correctness needs
 its own provenance and retrieval checks.
 

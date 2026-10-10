@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Embedding fingerprints name the chunk-boundary algorithm (`CHUNKER_VERSION`),
+  the break-point window and the index's chunk strategy. A chunker change marks
+  old vectors pending. Indexes embedded before this release need rebuilding
+  on the next `qmd embed`.
+- The chunk strategy belongs to the index. `qmd embed --chunk-strategy` and SDK
+  `embed({ chunkStrategy })` record it in `store_config`; later embeds without a
+  strategy keep it, and an index with none uses `regex`. Changing the strategy
+  marks vectors under the previous strategy pending, because vectors are stored
+  per content hash. A scoped run rebuilds the selected collection; the remaining
+  old-strategy hashes stay pending.
+- `qmd doctor` leaves legacy empty-fingerprint vectors pending for `qmd embed`
+  and stops adopting them: one matching sample cannot show that every
+  unversioned row matches today's chunk layout. `maybeAdoptLegacyEmbeddingFingerprint()`
+  stays available and reads the stored chunk strategy.
+
+### Fixed
+
+- One embed run replaces a stale chunk layout. When a hash's current sequence
+  is complete, QMD removes that hash's other rows with their partition vectors
+  in the same transaction. A failed replacement stays pending, other hashes
+  keep their vectors, and removed old rows never lower the embedded-chunk count.
+- `qmd doctor` checks the chunk at each sample's stored sequence and position,
+  rebuilt with the index's chunk strategy, so two chunks that share a start
+  keep their own texts.
+- `qmd embed --chunk-strategy <mode>` records the strategy when no document is
+  pending.
+
 ### Added
 
 - SDK `inspectVectorIndex()` checks selected model/fingerprint chunk layouts,
