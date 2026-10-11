@@ -4703,11 +4703,10 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
-  // Use a CTE to force FTS5 to run first, then filter by collection.
-  // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
-  // collection filter in a single WHERE clause, which can cause it to
-  // abandon the FTS5 index and fall back to a full scan — turning an 8ms
-  // query into a 17-second query on large collections.
+  // Materialize scoped FTS matches, then look up each matching document by ID.
+  // CROSS JOIN keeps those matches ahead of documents in SQLite's join order.
+  // For example, one match in a large collection needs one document lookup;
+  // an ordinary JOIN can scan the collection before checking that match.
   const params: (string | number)[] = [ftsQuery];
 
   // Unscoped, the MATCH is the whole answer: LIMIT inside the CTE lets FTS5
@@ -4739,7 +4738,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       fm.bm25_score,
       dm.metadata_json
     FROM fts_matches fm
-    JOIN documents d ON d.id = fm.rowid
+    CROSS JOIN documents d ON d.id = fm.rowid
     JOIN content ON content.hash = d.hash
     LEFT JOIN document_metadata dm ON dm.document_id = d.id
     WHERE d.active = 1

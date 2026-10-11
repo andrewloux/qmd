@@ -21,6 +21,9 @@
 
 ### Fixed
 
+- Scoped keyword search looks up documents from the FTS match set by ID, so a
+  selective match stays selective on indexes without SQLite planner statistics.
+  Collection and metadata filters still apply before the result limit.
 - One embed run replaces a stale chunk layout. When a hash's current sequence
   is complete, QMD removes that hash's other rows with their partition vectors
   in the same transaction. A failed replacement stays pending, other hashes

@@ -430,6 +430,44 @@ describe("structuredSearch with metadata filter", () => {
 describe("searchFTS with a collection scope and a metadata filter together", () => {
   const published: MetadataFilter = { field: "status", operator: "eq", value: "published" };
 
+  test("looks up matching documents by ID before applying collection and metadata scope", async () => {
+    for (let i = 0; i < 50; i++) {
+      await insertDoc("notes", `other-${i}.md`, "ordinary unrelated prose", { status: "published" });
+    }
+    await insertDoc("notes", "target.md", "distinctive lookup term", { status: "published" });
+
+    // Inspect the statement searchFTS executes, with its actual bound arguments.
+    let queryPlan: string[] = [];
+    const checked: Database = {
+      prepare: (sql: string) => {
+        const statement = store.db.prepare(sql);
+        if (!sql.includes("documents_fts MATCH")) return statement;
+        return {
+          ...statement,
+          run: statement.run.bind(statement),
+          get: statement.get.bind(statement),
+          iterate: statement.iterate.bind(statement),
+          all: (...params: SQLiteValue[]) => {
+            queryPlan = (store.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[])
+              .map(row => row.detail);
+            return statement.all(...params);
+          },
+        };
+      },
+      transaction: (fn) => store.db.transaction(fn),
+      exec: (sql: string) => store.db.exec(sql),
+      loadExtension: (path: string) => store.db.loadExtension(path),
+      close: () => store.db.close(),
+    };
+
+    const results = searchFTS(checked, "distinctive", 1, "notes", published);
+    expect(results.map(r => r.displayPath)).toEqual(["notes/target.md"]);
+    const matches = queryPlan.indexOf("SCAN fm");
+    const documentLookup = queryPlan.findIndex(detail => detail.startsWith("SEARCH d USING INTEGER PRIMARY KEY"));
+    expect(matches).toBeGreaterThanOrEqual(0);
+    expect(documentLookup).toBeGreaterThan(matches);
+  });
+
   test("returns the in-scope document the filter admits, past both the window and a stronger draft", async () => {
     // Every noise document outranks both small-collection documents globally,
     // and the draft outranks the target inside the small collection.
