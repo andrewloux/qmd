@@ -95,13 +95,17 @@ import {
   type MetadataEntryField,
 } from "./metadata-filter.js";
 import {
+  getMetadataCoverage as storeGetMetadataCoverage,
   listMetadata as storeListMetadata,
   MetadataBindingBudgetError,
   MetadataOptionError,
   type ListMetadataOptions,
   type ListMetadataResult,
+  type MetadataCoverageOptions,
+  type MetadataCoverageResult,
   type MetadataKeySummary,
   type MetadataKeyTypeSummary,
+  type MetadataTypeCoverage,
   type MetadataValueCount,
   type MetadataKeyOverview,
 } from "./metadata-store.js";
@@ -184,7 +188,7 @@ export type {
 };
 export { parseMetadataFilter, parseMetadataMatch, MetadataFilterError };
 
-// Re-export metadata discovery types (listMetadata() and status metadata keys)
+// Re-export metadata discovery types (listMetadata(), getMetadataCoverage(), and status metadata keys)
 export type {
   ListMetadataOptions,
   ListMetadataResult,
@@ -192,6 +196,9 @@ export type {
   MetadataKeyTypeSummary,
   MetadataValueCount,
   MetadataKeyOverview,
+  MetadataCoverageOptions,
+  MetadataCoverageResult,
+  MetadataTypeCoverage,
 };
 export { MetadataBindingBudgetError, MetadataOptionError };
 
@@ -390,6 +397,29 @@ export interface QMDStore {
    * SQL parameters than one statement allows.
    */
   listMetadata(options?: ListMetadataOptions): Promise<ListMetadataResult>;
+
+  /**
+   * Measure one metadata key without enumerating its values.
+   * `eligibleDocuments` counts the active documents in scope with a current,
+   * error-free metadata extraction that pass `filter`, whether or not they
+   * hold the key (listMetadata's `documents` counts every active document in
+   * scope); `coveredDocuments` counts those holding at least one value for it;
+   * `types` gives per stored type the documents, binary-distinct values, and
+   * whether any document holds more than one value. A one-element array counts
+   * as a scalar and leaves multiValued false. Extraction rejects an empty
+   * array, so that document stays outside `eligibleDocuments` until its
+   * extraction succeeds. For current, active documents a.status="draft",
+   * b.status="draft", c with no status, and d.status=["draft","published"],
+   * `getMetadataCoverage({ key: "status" })` returns eligibleDocuments 4,
+   * coveredDocuments 3, and one string type with
+   * documents 3, distinctValues 2, multiValued true. `collection` and `filter`
+   * mean what they mean for listMetadata, and the result comes from one
+   * database snapshot. Throws MetadataOptionError for a key a filter `field`
+   * could not name, MetadataFilterError for an invalid filter, and
+   * MetadataBindingBudgetError when the filter and key together bind more SQL
+   * parameters than one statement allows.
+   */
+  getMetadataCoverage(options: MetadataCoverageOptions): Promise<MetadataCoverageResult>;
 
   /** Get names of collections included by default in queries */
   getDefaultCollectionNames(): Promise<string[]>;
@@ -622,6 +652,10 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     listMetadata: async (opts) => storeListMetadata(db, {
       ...opts,
       match: opts?.match === undefined ? undefined : parseMetadataMatch(opts.match),
+      filter: opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter),
+    }),
+    getMetadataCoverage: async (opts) => storeGetMetadataCoverage(db, {
+      ...opts,
       filter: opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter),
     }),
     getDefaultCollectionNames: async () => {

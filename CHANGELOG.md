@@ -36,6 +36,16 @@
 
 ### Added
 
+- SDK `getMetadataCoverage({ key, collection, filter })` measures one metadata
+  key in one statement and one snapshot, so a caller can tell admitted
+  documents, key coverage and distinct grouping values apart before grouping
+  on the key. It returns `eligibleDocuments` (active documents in scope with a
+  current, error-free extraction that pass the filter), `coveredDocuments`
+  (those holding the key), and per stored type the documents, binary-distinct
+  values and whether a document holds multiple values. It applies
+  `listMetadata`'s scope, filter and
+  extraction gate and skips key ranking, value pages, ranges and collection
+  lists. `listMetadata` keeps its options and result.
 - SDK `inspectVectorIndex()` checks selected model/fingerprint chunk layouts,
   required active collection partitions, and both directions of physical
   map/vector integrity in one SQLite snapshot. It reports structural readiness

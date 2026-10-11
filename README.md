@@ -1195,7 +1195,25 @@ const nextPage = await store.listMetadata({ keyLimit: 50, keyOffset: 50 })
 
 `filter` is a `MetadataFilter` and `match` is a `MetadataMatch`. Both are `MetadataPredicate<Condition>`, the one recursive grammar over the conditions each record admits, so a document-only condition (`exists`, `all`, or a metadata key as the `field`) is a type error in a match as well as a runtime one. An option outside its domain throws `MetadataOptionError`, and a `filter` and `match` that together bind more SQL parameters than one statement allows throw `MetadataBindingBudgetError`.
 
-The MCP `metadata` tool takes the same options with `collections` spelled as on `query`, returns the CLI text plus the result as `structuredContent`, and the MCP `status` tool lists each collection's most covered keys so an agent's first call reveals that metadata exists. `POST /metadata` accepts the same body as the tool and returns the same result (`400` on an invalid match, filter, or option).
+`getMetadataCoverage({ key, collection?, filter? })` measures one key without enumerating its vocabulary. It separates three numbers a caller needs before grouping or filtering on a key: how many documents the scope and filter admit, how many of them hold the key, and how many distinct values each stored type has. Take four current, active documents: `a.status = "draft"`, `b.status = "draft"`, `c` with no status, and `d.status = ["draft", "published"]`.
+
+```typescript
+const coverage = await store.getMetadataCoverage({ key: "status" })
+// {
+//   key: "status",
+//   eligibleDocuments: 4,  // a, b, c, d: active, current, error-free extraction, in scope, passing the filter
+//   coveredDocuments: 3,   // a, b, d hold at least one status value
+//   types: [{ type: "string", documents: 3, distinctValues: 2, multiValued: true }],
+// }
+```
+
+- `eligibleDocuments` counts what filtering can see: active documents in scope with a current, error-free metadata extraction that pass the filter. `listMetadata().documents` counts every active document in scope.
+- Extraction rejects an empty array, so a document declaring `status: []` stays outside `eligibleDocuments` until its extraction succeeds.
+- A one-element array is indexed like a scalar and leaves `multiValued` false. `d` holds two values, so `status` reports `multiValued: true`.
+- `types` has one entry per stored type, ordered by documents descending, then type name ascending. `distinctValues` compares values in the type's own column, so `"1"` and `1` are two types with one value each.
+- `collection` and `filter` behave as in `listMetadata`, and the result comes from one snapshot. A key a filter `field` could not name throws `MetadataOptionError`.
+
+The MCP `metadata` tool takes `listMetadata`'s options with `collections` spelled as on `query`, returns the CLI text plus the result as `structuredContent`, and the MCP `status` tool lists each collection's most covered keys so an agent's first call reveals that metadata exists. `POST /metadata` accepts the same body as the tool and returns the same result (`400` on an invalid match, filter, or option).
 
 ### Output Format
 
