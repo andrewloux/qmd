@@ -51,6 +51,7 @@ import {
   type DocumentExcludedByIgnore,
   type DocumentLookupError,
   type SearchResult,
+  type CompactSearchResult,
   type HybridQueryResult,
   type HybridQueryOptions,
   type HybridQueryExplain,
@@ -148,6 +149,7 @@ export type {
   DocumentExcludedByIgnore,
   DocumentLookupError,
   SearchResult,
+  CompactSearchResult,
   HybridQueryResult,
   HybridQueryOptions,
   HybridQueryExplain,
@@ -288,6 +290,12 @@ export interface LexSearchOptions {
   filter?: MetadataFilter;
   /** Whether to include document body text on each hit (default: true). */
   includeBody?: boolean;
+  /**
+   * With `includeBody: false`, whether to report each hit's body length
+   * (default: true). False skips the content table and returns
+   * `CompactSearchResult` hits.
+   */
+  includeBodyLength?: boolean;
   /** Whether to resolve collection/path context on each hit (default: true). */
   includeContext?: boolean;
 }
@@ -353,6 +361,7 @@ export interface QMDStore {
   searchCandidates(options: CandidateSearchOptions): Promise<CandidateSearchResult>;
 
   /** BM25 keyword search (fast, no LLM) */
+  searchLex(query: string, options: LexSearchOptions & { includeBody: false; includeBodyLength: false }): Promise<CompactSearchResult[]>;
   searchLex(query: string, options?: LexSearchOptions): Promise<SearchResult[]>;
 
   /** Vector similarity search (embedding model, no reranking) */
@@ -617,8 +626,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     searchLex: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
       const retrieval =
-        opts?.includeBody !== undefined || opts?.includeContext !== undefined
-          ? { includeBody: opts.includeBody, includeContext: opts.includeContext }
+        opts?.includeBody !== undefined || opts?.includeBodyLength !== undefined || opts?.includeContext !== undefined
+          ? { includeBody: opts.includeBody, includeBodyLength: opts.includeBodyLength, includeContext: opts.includeContext }
           : undefined;
       return internal.searchFTS(q, opts?.limit, opts?.collection, filter, retrieval);
     },

@@ -1654,7 +1654,10 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions) => SearchResult[];
+  searchFTS: {
+    (query: string, limit: number | undefined, collectionName: string | readonly string[] | undefined, filter: MetadataFilter | undefined, retrieval: CompactRetrievalOptions): CompactSearchResult[];
+    (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): SearchResult[];
+  };
   searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
@@ -2884,6 +2887,9 @@ export type SearchResult = DocumentResult & {
   chunkPos?: number;          // Character position of matching chunk (for vector search)
   chunkSeq?: number;          // Stored chunk sequence, returned by compact vector retrieval
 };
+
+/** A lexical hit read without the content table: it carries no body and no body length. */
+export type CompactSearchResult = Omit<SearchResult, "body" | "bodyLength">;
 
 /**
  * Ranked result for RRF fusion (simplified, used internally)
@@ -4701,6 +4707,11 @@ export type VectorScanCoverage = {
 export type SearchRetrievalOptions = {
   /** Compact retrieval defers document bodies until candidate admission. */
   includeBody?: boolean;
+  /**
+   * With `includeBody: false`, false also skips the body length, so lexical
+   * retrieval never reads the content table (default: true).
+   */
+  includeBodyLength?: boolean;
   /** Defer context lookup until final representative selection. */
   includeContext?: boolean;
   /** Reports the final KNN scan of each collection target. */
@@ -4727,8 +4738,16 @@ function prepareFtsStatement(db: Database, sql: string): ReturnType<Database["pr
   return stmt;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): SearchResult[] {
+/** Retrieval that reads neither body nor body length, so lexical search skips the content table. */
+export type CompactRetrievalOptions = SearchRetrievalOptions & { includeBody: false; includeBodyLength: false };
+
+export function searchFTS(db: Database, query: string, limit: number | undefined, collectionName: string | readonly string[] | undefined, filter: MetadataFilter | undefined, retrieval: CompactRetrievalOptions): CompactSearchResult[];
+export function searchFTS(db: Database, query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): SearchResult[];
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): (SearchResult | CompactSearchResult)[] {
   const names = scopedCollectionNames(collectionName);
+  // Every document's hash references a content row (foreign key), so dropping
+  // the join keeps the same documents when nothing reads the content.
+  const readsContent = retrieval?.includeBody !== false || retrieval.includeBodyLength !== false;
 
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
@@ -4763,13 +4782,13 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.collection || '/' || d.path as display_path,
       d.title,
       ${retrieval?.includeBody === false ? "''" : cappedBodySql("content.doc")} as body,
-      ${retrieval?.includeBody === false ? "length(CAST(content.doc AS BLOB)) as body_length," : ""}
+      ${retrieval?.includeBody === false && readsContent ? "length(CAST(content.doc AS BLOB)) as body_length," : ""}
       d.hash,
       fm.bm25_score,
       dm.metadata_json
     FROM fts_matches fm
     CROSS JOIN documents d ON d.id = fm.rowid
-    JOIN content ON content.hash = d.hash
+    ${readsContent ? "JOIN content ON content.hash = d.hash" : ""}
     LEFT JOIN document_metadata dm ON dm.document_id = d.id
     WHERE d.active = 1
   `;
@@ -4813,7 +4832,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       docid: getDocid(row.hash),
       collectionName,
       modifiedAt: "",  // Not available in FTS query
-      bodyLength: retrieval?.includeBody === false ? row.body_length : row.body.length,
+      ...(readsContent ? { bodyLength: retrieval?.includeBody === false ? row.body_length : row.body.length } : {}),
       ...(retrieval?.includeBody === false ? {} : { body: row.body }),
       context: retrieval?.includeContext === false ? null : getContextForFile(db, row.filepath),
       metadata: parseMetadataJson(row.metadata_json),

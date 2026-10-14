@@ -337,6 +337,29 @@ function resetObservations(): void {
 }
 
 describe("compact backend retrieval", () => {
+  test("lexical retrieval without body or body length never reads the content table", () => {
+    const lexical = (includeBodyLength: boolean) =>
+      store.searchFTS("compactprobe", 1, "compact", undefined, { includeBody: false, includeBodyLength } as { includeBody: false; includeBodyLength: false });
+    const compact = store.searchFTS("compactprobe", 1, "compact", undefined, { includeBody: false })[0]!;
+    const { bodyLength, ...rest } = compact;
+    expect(bodyLength).toBe(Buffer.byteLength("compactprobe 😀 café", "utf8"));
+    expect(lexical(false)).toEqual([rest]);
+    expect(Object.hasOwn(lexical(false)[0]!, "bodyLength")).toBe(false);
+
+    // Without its content row the document stays indexed: only retrieval that reads content loses it.
+    const row = store.db.prepare(`SELECT * FROM content WHERE hash = ?`).get(compact.hash) as Record<string, string>;
+    store.db.exec("PRAGMA foreign_keys = OFF");
+    try {
+      store.db.prepare(`DELETE FROM content WHERE hash = ?`).run(compact.hash);
+      expect(lexical(false)).toEqual([rest]);
+      expect(lexical(true)).toEqual([]);
+    } finally {
+      store.db.prepare(`INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)`).run(row.hash, row.doc, row.created_at);
+      store.db.exec("PRAGMA foreign_keys = ON");
+    }
+    expect(lexical(true)).toEqual([compact]);
+  });
+
   test("omits bodies, reports UTF-8 bytes, and preserves the default JSON shape", async () => {
     resetObservations();
     const expectedBody = "compactprobe 😀 café";
