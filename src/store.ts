@@ -1966,11 +1966,22 @@ async function reindexCollectionIn(
     if (extraction.error) metadataErrors++;
   };
 
+  const realCollectionPath = getRealPath(collectionPath);
+  const resolvedCollectionPath = resolve(collectionPath);
+
   for (const relativeFile of files) {
     batch.next();
     const path = normalizePathSeparators(relativeFile);
-    const filepath = getRealPath(resolve(collectionPath, relativeFile));
-    if (!isPathInsideDir(collectionPath, filepath)) {
+    const resolvedTarget = resolve(collectionPath, relativeFile);
+    let filepath = resolvedTarget;
+    let insideCollection = false;
+    try {
+      filepath = realpathSync(resolvedTarget);
+      insideCollection = getRelativePathFromPrefix(filepath, realCollectionPath) !== null;
+    } catch {
+      insideCollection = getRelativePathFromPrefix(resolvedTarget, resolvedCollectionPath) !== null;
+    }
+    if (!insideCollection) {
       processed++;
       skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
       options?.onProgress?.({ file: relativeFile, current: processed, total });
@@ -4222,9 +4233,6 @@ export function getContextForFile(db: Database, filepath: string): string | null
   // Handle undefined or null filepath
   if (!filepath) return null;
 
-  // Get all collections from DB
-  const collections = getStoreCollections(db);
-
   // Parse virtual path format: qmd://collection/path
   let collectionName: string | null = null;
   let relativePath: string | null = null;
@@ -4234,6 +4242,8 @@ export function getContextForFile(db: Database, filepath: string): string | null
     collectionName = parsedVirtual.collectionName;
     relativePath = parsedVirtual.path;
   } else {
+    // Get all collections from DB
+    const collections = getStoreCollections(db);
     // Filesystem path: find which collection this absolute path belongs to
     for (const coll of collections) {
       // Skip collections with missing paths
@@ -4697,6 +4707,26 @@ export type SearchRetrievalOptions = {
   onVectorScan?: (coverage: VectorScanCoverage) => void;
 };
 
+const ftsStatementCache = new WeakMap<Database, Map<string, ReturnType<Database["prepare"]>>>();
+const MAX_FTS_CACHED_STATEMENTS = 64;
+
+function prepareFtsStatement(db: Database, sql: string): ReturnType<Database["prepare"]> {
+  let cache = ftsStatementCache.get(db);
+  if (!cache) {
+    cache = new Map();
+    ftsStatementCache.set(db, cache);
+  }
+  let stmt = cache.get(sql);
+  if (stmt) return stmt;
+  if (cache.size >= MAX_FTS_CACHED_STATEMENTS) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  stmt = db.prepare(sql);
+  cache.set(sql, stmt);
+  return stmt;
+}
+
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter, retrieval?: SearchRetrievalOptions): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
 
@@ -4745,8 +4775,13 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   `;
 
   if (names) {
-    sql += ` AND d.collection IN (SELECT value FROM json_each(?))`;
-    params.push(JSON.stringify(names));
+    if (names.length === 1) {
+      sql += ` AND d.collection = ?`;
+      params.push(names[0]!);
+    } else {
+      sql += ` AND d.collection IN (SELECT value FROM json_each(?))`;
+      params.push(JSON.stringify(names));
+    }
   }
 
   if (filter) {
@@ -4762,7 +4797,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY fm.bm25_score ASC, filepath ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; body_length: number; hash: string; bm25_score: number; metadata_json: string | null }[];
+  const rows = prepareFtsStatement(db, sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; body_length: number; hash: string; bm25_score: number; metadata_json: string | null }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.

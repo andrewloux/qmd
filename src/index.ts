@@ -286,6 +286,10 @@ export interface LexSearchOptions {
   collection?: string | string[];
   /** Metadata filter — every returned result satisfies it */
   filter?: MetadataFilter;
+  /** Whether to include document body text on each hit (default: true). */
+  includeBody?: boolean;
+  /** Whether to resolve collection/path context on each hit (default: true). */
+  includeContext?: boolean;
 }
 
 /**
@@ -612,7 +616,11 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     searchCandidates: opts => searchCandidates(internal, opts),
     searchLex: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
-      return internal.searchFTS(q, opts?.limit, opts?.collection, filter);
+      const retrieval =
+        opts?.includeBody !== undefined || opts?.includeContext !== undefined
+          ? { includeBody: opts.includeBody, includeContext: opts.includeContext }
+          : undefined;
+      return internal.searchFTS(q, opts?.limit, opts?.collection, filter, retrieval);
     },
     searchVector: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);

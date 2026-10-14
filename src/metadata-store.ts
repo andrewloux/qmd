@@ -156,23 +156,55 @@ export function syncDocumentMetadata(
  * Replace a document's metadata rows atomically. A failed extraction persists
  * empty metadata plus the error, so stale metadata never survives a bad edit.
  */
+export type MetadataStatements = {
+  upsertMetadata: ReturnType<Database["prepare"]>;
+  deleteValues: ReturnType<Database["prepare"]>;
+  insertValue: ReturnType<Database["prepare"]>;
+  selectStored: ReturnType<Database["prepare"]>;
+  selectCurrent: ReturnType<Database["prepare"]>;
+};
+
+const metadataStatementsByDb = new WeakMap<Database, MetadataStatements>();
+
+function getMetadataStatements(db: Database): MetadataStatements {
+  let stmts = metadataStatementsByDb.get(db);
+  if (!stmts) {
+    stmts = {
+      upsertMetadata: db.prepare(`
+        INSERT INTO document_metadata (document_id, metadata_json, extraction_version, extraction_error, extracted_at, source)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id) DO UPDATE SET
+          metadata_json = excluded.metadata_json,
+          extraction_version = excluded.extraction_version,
+          extraction_error = excluded.extraction_error,
+          extracted_at = excluded.extracted_at,
+          source = excluded.source
+      `),
+      deleteValues: db.prepare(`DELETE FROM document_metadata_values WHERE document_id = ?`),
+      insertValue: db.prepare(`
+        INSERT INTO document_metadata_values (document_id, key, ordinal, value_type, text_value, number_value, boolean_value)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `),
+      selectStored: db.prepare(`
+        SELECT source, metadata_json, extraction_version, extraction_error
+        FROM document_metadata WHERE document_id = ?
+      `),
+      selectCurrent: db.prepare(`SELECT extraction_version, source FROM document_metadata WHERE document_id = ?`),
+    };
+    metadataStatementsByDb.set(db, stmts);
+  }
+  return stmts;
+}
+
 export function replaceDocumentMetadata(
   db: Database,
   documentId: number,
   extraction: MetadataExtractionResult,
   origin: DocumentMetadataOrigin = "frontmatter",
 ): void {
+  const stmts = getMetadataStatements(db);
   const replace = db.transaction(() => {
-    db.prepare(`
-      INSERT INTO document_metadata (document_id, metadata_json, extraction_version, extraction_error, extracted_at, source)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(document_id) DO UPDATE SET
-        metadata_json = excluded.metadata_json,
-        extraction_version = excluded.extraction_version,
-        extraction_error = excluded.extraction_error,
-        extracted_at = excluded.extracted_at,
-        source = excluded.source
-    `).run(
+    stmts.upsertMetadata.run(
       documentId,
       JSON.stringify(extraction.metadata),
       extraction.extractionVersion,
@@ -181,17 +213,12 @@ export function replaceDocumentMetadata(
       origin,
     );
 
-    db.prepare(`DELETE FROM document_metadata_values WHERE document_id = ?`).run(documentId);
-
-    const insertValue = db.prepare(`
-      INSERT INTO document_metadata_values (document_id, key, ordinal, value_type, text_value, number_value, boolean_value)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
+    stmts.deleteValues.run(documentId);
 
     for (const [key, value] of Object.entries(extraction.metadata)) {
       const scalars = Array.isArray(value) ? value : [value];
       scalars.forEach((scalar, ordinal) => {
-        insertValue.run(
+        stmts.insertValue.run(
           documentId,
           key,
           ordinal,
@@ -213,10 +240,8 @@ export function replaceDocumentMetadata(
  * and its `extracted_at`.
  */
 export function syncExternalDocumentMetadata(db: Database, documentId: number, extraction: MetadataExtractionResult): void {
-  const stored = db.prepare(`
-    SELECT source, metadata_json, extraction_version, extraction_error
-    FROM document_metadata WHERE document_id = ?
-  `).get(documentId) as {
+  const stmts = getMetadataStatements(db);
+  const stored = stmts.selectStored.get(documentId) as {
     source: DocumentMetadataOrigin;
     metadata_json: string;
     extraction_version: number;
@@ -237,7 +262,7 @@ export function syncExternalDocumentMetadata(db: Database, documentId: number, e
 // A row from a metadata source is stale for frontmatter extraction, so a
 // default update re-reads the file and re-extracts it.
 function isDocumentMetadataCurrent(db: Database, documentId: number): boolean {
-  const row = db.prepare(`SELECT extraction_version, source FROM document_metadata WHERE document_id = ?`)
+  const row = getMetadataStatements(db).selectCurrent
     .get(documentId) as { extraction_version: number; source: DocumentMetadataOrigin } | undefined;
   return row?.extraction_version === METADATA_EXTRACTION_VERSION && row.source === "frontmatter";
 }
