@@ -163,6 +163,35 @@ describe("lexical locations", () => {
     });
   });
 
+  test("prefers the primary anchor occurrence closest to peer query anchors", () => {
+    const body = `Codex header ${"x".repeat(800)} push verified by Codex check ${"y".repeat(400)} Codex footer`;
+    const clusteredStart = body.indexOf("Codex check");
+    const result = locateLexical(
+      body,
+      "Codex push",
+      REF,
+      { maxUtf8Bytes: 64, maxUnicodeScalars: 64 },
+    );
+
+    expect(result?.location).toEqual({
+      ...REF,
+      kind: "lexical_exact",
+      anchorKind: "literal",
+      matchedText: "Codex",
+      startUtf16: clusteredStart,
+      endUtf16: clusteredStart + "Codex".length,
+    });
+    expect(result?.passage.text).toContain("push verified by Codex check");
+  });
+
+  test("preserves earliest occurrence on tied multi-anchor cluster widths", () => {
+    const body = "Orbit alpha ... alpha Orbit";
+    const result = locateLexical(body, "Orbit alpha", REF, { maxUtf8Bytes: 32 });
+
+    expect(result?.location.startUtf16).toBe(0);
+    expect(result?.location.endUtf16).toBe("Orbit".length);
+  });
+
   test("preserves reference validation precedence", () => {
     expect(() => locateLexical(
       "body",

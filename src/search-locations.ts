@@ -273,7 +273,7 @@ export function locateLexical(
   };
 }
 
-/** Locate the first strongest positive lexical anchor in the document body. */
+/** Locate the strongest positive lexical anchor in the document body, preferring the tightest multi-anchor cluster when the primary anchor repeats. */
 export function findLexicalLocation(
   body: string,
   query: string,
@@ -281,9 +281,33 @@ export function findLexicalLocation(
 ): LexicalLocation | null {
   assertDocumentRef(ref);
   const anchors = parsePositiveLexicalAnchors(query);
-  for (const anchor of anchors) {
-    const span = findExactAnchor(body, anchor);
-    if (!span) continue;
+  if (anchors.length === 0) return null;
+
+  const singleAnchor = anchors.length === 1;
+  let bodyTokens: ApproximateBodyToken[] | undefined;
+  const tokens = (): readonly ApproximateBodyToken[] => (bodyTokens ??= tokenizeApproximateBody(body));
+
+  for (let index = 0; index < anchors.length; index++) {
+    const anchor = anchors[index]!;
+    const primarySpans = findExactAnchors(body, anchor, singleAnchor ? 1 : Number.POSITIVE_INFINITY);
+    if (primarySpans.length === 0) continue;
+
+    let span = primarySpans[0]!;
+    if (primarySpans.length > 1 && anchors.length > 1) {
+      const peerLists: Utf16Span[][] = [];
+      for (let peerIndex = 0; peerIndex < anchors.length; peerIndex++) {
+        if (peerIndex === index) continue;
+        const peer = anchors[peerIndex]!;
+        const exactPeers = findExactAnchors(body, peer);
+        if (exactPeers.length > 0) {
+          peerLists.push(exactPeers);
+        } else {
+          const approximatePeers = findApproximateAnchors(tokens(), peer);
+          if (approximatePeers.length > 0) peerLists.push(approximatePeers);
+        }
+      }
+      span = selectClusteredSpan(primarySpans, peerLists);
+    }
 
     return {
       ...ref,
@@ -294,10 +318,20 @@ export function findLexicalLocation(
     };
   }
 
-  const bodyTokens = tokenizeApproximateBody(body);
-  for (const anchor of anchors) {
-    const span = findApproximateAnchor(bodyTokens, anchor);
-    if (!span) continue;
+  for (let index = 0; index < anchors.length; index++) {
+    const anchor = anchors[index]!;
+    const primarySpans = findApproximateAnchors(tokens(), anchor, singleAnchor ? 1 : Number.POSITIVE_INFINITY);
+    if (primarySpans.length === 0) continue;
+
+    let span = primarySpans[0]!;
+    if (primarySpans.length > 1 && anchors.length > 1) {
+      const peerLists: Utf16Span[][] = [];
+      for (let peerIndex = index + 1; peerIndex < anchors.length; peerIndex++) {
+        const peerSpans = findApproximateAnchors(tokens(), anchors[peerIndex]!);
+        if (peerSpans.length > 0) peerLists.push(peerSpans);
+      }
+      span = selectClusteredSpan(primarySpans, peerLists);
+    }
 
     return {
       ...ref,
@@ -331,31 +365,95 @@ export function selectionWindowLocation(
   return { ...ref, ...span, kind: "selection_window", origin: "keyword_intent" };
 }
 
-function findExactAnchor(body: string, anchor: PositiveLexicalAnchor): Utf16Span | null {
+function selectClusteredSpan(
+  primarySpans: readonly Utf16Span[],
+  peerLists: readonly (readonly Utf16Span[])[],
+): Utf16Span {
+  if (primarySpans.length <= 1 || peerLists.length === 0) {
+    return primarySpans[0]!;
+  }
+
+  const peerCursors = new Array<number>(peerLists.length).fill(0);
+  let bestSpan = primarySpans[0]!;
+  let bestWidths: number[] | null = null;
+
+  for (const candidate of primarySpans) {
+    const widths: number[] = [];
+    for (let peerIndex = 0; peerIndex < peerLists.length; peerIndex++) {
+      const peers = peerLists[peerIndex]!;
+      let cursor = peerCursors[peerIndex]!;
+      while (cursor + 1 < peers.length && peers[cursor + 1]!.startUtf16 <= candidate.startUtf16) {
+        cursor++;
+      }
+      peerCursors[peerIndex] = cursor;
+
+      let minWidth = spanEnvelopeWidth(candidate, peers[cursor]!);
+      if (cursor + 1 < peers.length) {
+        const nextWidth = spanEnvelopeWidth(candidate, peers[cursor + 1]!);
+        if (nextWidth < minWidth) minWidth = nextWidth;
+      }
+      widths.push(minWidth);
+    }
+
+    widths.sort((left, right) => left - right);
+    if (bestWidths === null || compareWidthVectors(widths, bestWidths) < 0) {
+      bestSpan = candidate;
+      bestWidths = widths;
+    }
+  }
+
+  return bestSpan;
+}
+
+function spanEnvelopeWidth(left: Utf16Span, right: Utf16Span): number {
+  return Math.max(left.endUtf16, right.endUtf16) - Math.min(left.startUtf16, right.startUtf16);
+}
+
+function compareWidthVectors(left: readonly number[], right: readonly number[]): number {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index++) {
+    const diff = left[index]! - right[index]!;
+    if (diff !== 0) return diff;
+  }
+  return left.length - right.length;
+}
+
+function findExactAnchors(
+  body: string,
+  anchor: PositiveLexicalAnchor,
+  limit = Number.POSITIVE_INFINITY,
+): Utf16Span[] {
+  const spans: Utf16Span[] = [];
+  const firstAnchorScalar = anchor.text.slice(0, nextScalarEnd(anchor.text, 0));
+  const lastAnchorStart = previousScalarStart(anchor.text, anchor.text.length);
+  const lastAnchorScalar = anchor.text.slice(lastAnchorStart);
+  const firstIsCjk = containsCjk(firstAnchorScalar);
+  const lastIsCjk = containsCjk(lastAnchorScalar);
   const pattern = new RegExp(escapeRegExp(anchor.text), "giu");
+
   for (const match of body.matchAll(pattern)) {
     const startUtf16 = match.index;
     const matchedText = match[0];
     if (startUtf16 === undefined || matchedText === undefined) continue;
     const endUtf16 = startUtf16 + matchedText.length;
 
-    const firstAnchorScalar = anchor.text.slice(0, nextScalarEnd(anchor.text, 0));
-    const lastAnchorStart = previousScalarStart(anchor.text, anchor.text.length);
-    const lastAnchorScalar = anchor.text.slice(lastAnchorStart);
-    const startsAtBoundary = containsCjk(firstAnchorScalar) || isTokenBoundary(body, startUtf16);
-    const endsAtBoundary = containsCjk(lastAnchorScalar) || isTokenBoundary(body, endUtf16);
+    const startsAtBoundary = firstIsCjk || isTokenBoundary(body, startUtf16);
+    const endsAtBoundary = lastIsCjk || isTokenBoundary(body, endUtf16);
     if (startsAtBoundary && (anchor.match === "prefix" || endsAtBoundary)) {
-      return { startUtf16, endUtf16 };
+      spans.push({ startUtf16, endUtf16 });
+      if (spans.length >= limit) break;
     }
   }
-  return null;
+  return spans;
 }
 
-function findApproximateAnchor(
+function findApproximateAnchors(
   bodyTokens: readonly ApproximateBodyToken[],
   anchor: PositiveLexicalAnchor,
-): Utf16Span | null {
-  if (anchor.tokens.length === 0) return null;
+  limit = Number.POSITIVE_INFINITY,
+): Utf16Span[] {
+  const spans: Utf16Span[] = [];
+  if (anchor.tokens.length === 0) return spans;
 
   for (let bodyIndex = 0; bodyIndex + anchor.tokens.length <= bodyTokens.length; bodyIndex++) {
     let matches = true;
@@ -370,14 +468,15 @@ function findApproximateAnchor(
     }
 
     if (matches) {
-      return {
+      spans.push({
         startUtf16: bodyTokens[bodyIndex]!.startUtf16,
         endUtf16: bodyTokens[bodyIndex + anchor.tokens.length - 1]!.endUtf16,
-      };
+      });
+      if (spans.length >= limit) break;
     }
   }
 
-  return null;
+  return spans;
 }
 
 function tokensApproximate(query: string, body: string, prefixAllowed: boolean): boolean {
