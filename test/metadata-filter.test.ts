@@ -515,6 +515,56 @@ describe("compileMetadataFilter semantics", () => {
     }
   });
 
+  test("an and over candidates decides its eq and exists operands in one scan of the document's rows", () => {
+    insertDoc("a.md", { status: "published", topics: ["x", "y"], priority: 3 });
+    insertDoc("b.md", { status: "draft", topics: ["x"] });
+    insertDoc("c.md", { status: "published", priority: 3 });
+    insertDoc("d.md", { status: "published", topics: ["y"], draft: true });
+    insertDoc("e.md", { status: 3, topics: ["x"] });
+    insertDoc("f.md", { Status: "published", topics: ["x"] });
+    const wide = Object.fromEntries(Array.from({ length: 22 }, (_, index) => [`k${index}`, index]));
+    insertDoc("wide.md", wide);
+
+    // matchPaths also checks each result against the corpus scope, which compiles one subquery per condition.
+    const and = (...operands: MetadataFilter[]): MetadataFilter => ({ operator: "and", operands });
+    const published: MetadataFilter = { field: "status", operator: "eq", value: "published" };
+    const hasTopics: MetadataFilter = { field: "topics", operator: "exists", value: true };
+    const notDraft: MetadataFilter = { field: "draft", operator: "exists", value: false };
+    expect(matchPaths(and(published, hasTopics))).toEqual(["a.md", "d.md"]);
+    expect(matchPaths(and(published, notDraft))).toEqual(["a.md", "c.md"]);
+    expect(matchPaths(and(published, { field: "topics", operator: "eq", value: "y" }, notDraft))).toEqual(["a.md"]);
+    expect(matchPaths(and({ ...published, value: "PUBLISHED", caseInsensitive: true }, hasTopics))).toEqual(["a.md", "d.md"]);
+    // A field fuses once; its later operands keep their own subqueries.
+    expect(matchPaths(and(published, { field: "status", operator: "exists", value: true }, hasTopics))).toEqual(["a.md", "d.md"]);
+    expect(matchPaths(and({ field: "topics", operator: "eq", value: "x" }, { field: "topics", operator: "eq", value: "y" }))).toEqual(["a.md"]);
+    expect(matchPaths({ operator: "not", operand: and(published, hasTopics) })).toEqual(["b.md", "c.md", "e.md", "f.md", "wide.md"]);
+    expect(matchPaths(and(published, { field: "priority", operator: "gt", value: 2 }, hasTopics))).toEqual(["a.md"]);
+    // Twenty positive operands fuse; the 21st and 22nd keep their own subqueries.
+    const wideOperands = Object.entries(wide).map(([field, value]): MetadataFilter => ({ field, operator: "eq", value }));
+    expect(matchPaths(and(...wideOperands))).toEqual(["wide.md"]);
+    expect(matchPaths(and(...wideOperands.slice(0, 21), { field: "k21", operator: "eq", value: 0 }))).toEqual([]);
+    expect(matchPaths(and(...wideOperands.slice(1, 20), { field: "k0", operator: "eq", value: 1 }))).toEqual([]);
+
+    const compiled = compileMetadataFilter(parseMetadataFilter(and(published, hasTopics, notDraft)), "d");
+    expect(compiled.sql).toBe(
+      "((SELECT COALESCE(SUM(DISTINCT CASE WHEN mv.key = ? AND mv.value_type = 'string' AND mv.text_value = ? THEN 1" +
+      " WHEN mv.key = ? THEN 2 WHEN mv.key = ? THEN 1048576 ELSE 0 END), 0)" +
+      " FROM document_metadata_values mv WHERE mv.document_id = d.id) = 3)",
+    );
+    expect(compiled.params).toEqual(["status", "published", "topics", "draft"]);
+    expect(compileMetadataFilter(parseMetadataFilter(and(published, { field: "priority", operator: "gt", value: 2 })), "d").sql)
+      .not.toContain("SUM(DISTINCT");
+
+    for (const statistics of [false, true]) {
+      if (statistics) db.exec("ANALYZE");
+      const plan = (db.prepare(`EXPLAIN QUERY PLAN SELECT COUNT(*) FROM documents d WHERE ${compiled.sql}`)
+        .all(...compiled.params) as { detail: string }[])
+        .map(row => row.detail)
+        .filter(detail => detail.includes(" mv "));
+      expect(plan, plan.join(" | ")).toEqual([expect.stringContaining("INDEX sqlite_autoindex_document_metadata_values_1 (document_id=?)")]);
+    }
+  });
+
   test("the corpus scope compiles each condition to one uncorrelated document set", () => {
     for (let index = 0; index < 64; index++) {
       insertDoc(`d${index}.md`, { status: index % 2 ? "published" : "draft", priority: index });

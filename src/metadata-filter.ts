@@ -469,6 +469,10 @@ function compileFilterNode(filter: MetadataFilter, target: FilterTarget, params:
   switch (filter.operator) {
     case "and":
     case "or": {
+      if (filter.operator === "and" && target.scope === "candidates") {
+        const fused = compileFusedConditions(filter.operands, target, params);
+        if (fused !== undefined) return fused;
+      }
       const joiner = filter.operator === "and" ? " AND " : " OR ";
       return `(${filter.operands.map(operand => compileFilterNode(operand, target, params)).join(joiner)})`;
     }
@@ -551,6 +555,74 @@ function compileFilterNode(filter: MetadataFilter, target: FilterTarget, params:
       return buildConditionSql(target, "byDocument", `${columns.type} = 'string' AND ${textSql}`);
     }
   }
+}
+
+/** A condition one scan of a document's rows can decide: an `eq` or an `exists`. */
+type FusibleCondition =
+  | (Extract<MetadataCondition, { operator: "eq" | "ne" }> & { operator: "eq" })
+  | Extract<MetadataCondition, { operator: "exists" }>;
+
+/** Positive fused conditions each own one bit below this one; every absent key adds this bit. */
+const MAX_FUSED_POSITIVES = 20;
+const ABSENT_KEY_BIT = 1 << MAX_FUSED_POSITIVES;
+
+function isFusible(operand: MetadataFilter): operand is FusibleCondition {
+  return operand.operator === "eq" || operand.operator === "exists";
+}
+
+/**
+ * An `and` over candidates whose `eq` and `exists` operands, at most one per
+ * field, become one correlated scan of the document's own rows through the
+ * primary key, where each operand alone would take its own subquery. Each row
+ * adds the bit of the positive operand it satisfies, and any row under an
+ * `exists: false` key adds `ABSENT_KEY_BIT`; `SUM(DISTINCT ...)` counts each
+ * bit once, however many array elements set it. The document passes when the
+ * sum is exactly the positive bits: every positive operand held on some row
+ * and no absent key appears. The other operands compile as usual beside it.
+ * Returns undefined when fewer than two operands fuse.
+ *
+ * | operands | rows of the document | sum | passes |
+ * |---|---|---|---|
+ * | status eq "a", topics exists | status "a", topics "x", topics "y" | 1 + 2 | yes: 3 |
+ * | status eq "a", topics exists | status "b", topics "x" | 2 | no |
+ * | status eq "a", draft exists false | status "a" | 1 | yes: 1 |
+ * | status eq "a", draft exists false | status "a", draft true | 1 + 2^20 | no |
+ */
+function compileFusedConditions(
+  operands: readonly MetadataFilter[],
+  target: FilterTarget,
+  params: (string | number)[],
+): string | undefined {
+  const fused: FusibleCondition[] = [];
+  const rest: MetadataFilter[] = [];
+  const fields = new Set<string>();
+  let positives = 0;
+  for (const operand of operands) {
+    const absent = operand.operator === "exists" && !operand.value;
+    if (isFusible(operand) && !fields.has(operand.field) && (absent || positives < MAX_FUSED_POSITIVES)) {
+      fields.add(operand.field);
+      fused.push(operand);
+      if (!absent) positives++;
+    } else {
+      rest.push(operand);
+    }
+  }
+  if (fused.length < 2) return undefined;
+
+  const columns = DOCUMENT_VALUE_COLUMNS;
+  let bit = 0;
+  const cases = fused.map(condition => {
+    if (condition.operator === "exists") {
+      params.push(condition.field);
+      return `WHEN mv.key = ? THEN ${condition.value ? 1 << bit++ : ABSENT_KEY_BIT}`;
+    }
+    const columnSql = buildOperandColumnSql(columns, condition.value, condition.caseInsensitive);
+    params.push(condition.field, bindOperand(condition.value, condition.caseInsensitive));
+    return `WHEN mv.key = ? AND ${columns.type} = '${valueTypeOf(condition.value)}' AND ${columnSql} = ? THEN ${1 << bit++}`;
+  });
+  const fusedSql = `(SELECT COALESCE(SUM(DISTINCT CASE ${cases.join(" ")} ELSE 0 END), 0) ` +
+    `FROM document_metadata_values mv WHERE mv.document_id = ${target.alias}.id) = ${(1 << positives) - 1}`;
+  return `(${[fusedSql, ...rest.map(operand => compileFilterNode(operand, target, params))].join(" AND ")})`;
 }
 
 /**
