@@ -562,66 +562,71 @@ type FusibleCondition =
   | (Extract<MetadataCondition, { operator: "eq" | "ne" }> & { operator: "eq" })
   | Extract<MetadataCondition, { operator: "exists" }>;
 
-/** Positive fused conditions each own one bit below this one; every absent key adds this bit. */
-const MAX_FUSED_POSITIVES = 20;
-const ABSENT_KEY_BIT = 1 << MAX_FUSED_POSITIVES;
-
 function isFusible(operand: MetadataFilter): operand is FusibleCondition {
   return operand.operator === "eq" || operand.operator === "exists";
 }
 
 /**
  * An `and` over candidates whose `eq` and `exists` operands, at most one per
- * field, become one correlated scan of the document's own rows through the
- * primary key, where each operand alone would take its own subquery. Each row
- * adds the bit of the positive operand it satisfies, and any row under an
- * `exists: false` key adds `ABSENT_KEY_BIT`; `SUM(DISTINCT ...)` counts each
- * bit once, however many array elements set it. The document passes when the
- * sum is exactly the positive bits: every positive operand held on some row
- * and no absent key appears. The other operands compile as usual beside it.
- * Returns undefined when fewer than two operands fuse.
+ * field, become one correlated aggregate over the document's own rows, read
+ * through the primary key, where each operand alone would take its own
+ * subquery. The positive operands (`eq`, `exists: true`) are numbered 1..P,
+ * and a row that satisfies operand i yields i. The document passes when its
+ * rows yield P distinct numbers and none of its rows sits under an
+ * `exists: false` key; `COUNT(DISTINCT ...)` counts an operand once however
+ * many array elements satisfy it. With no positive operand, the absent keys
+ * take one `NOT EXISTS`. The other operands, later operands on a fused field
+ * among them, compile as usual beside it. Returns undefined when fewer than
+ * two operands fuse.
  *
- * | operands | rows of the document | sum | passes |
- * |---|---|---|---|
- * | status eq "a", topics exists | status "a", topics "x", topics "y" | 1 + 2 | yes: 3 |
- * | status eq "a", topics exists | status "b", topics "x" | 2 | no |
- * | status eq "a", draft exists false | status "a" | 1 | yes: 1 |
- * | status eq "a", draft exists false | status "a", draft true | 1 + 2^20 | no |
+ * | operands | rows of the document | numbers | absent-key rows | passes |
+ * |---|---|---|---|---|
+ * | status eq "a", topics exists | status "a", topics "x", topics "y" | 1, 2 | 0 | yes |
+ * | status eq "a", topics exists | status "b", topics "x" | 2 | 0 | no |
+ * | status eq "a", draft exists false | status "a" | 1 | 0 | yes |
+ * | status eq "a", draft exists false | status "a", draft true | 1 | 1 | no |
  */
 function compileFusedConditions(
   operands: readonly MetadataFilter[],
   target: FilterTarget,
   params: (string | number)[],
 ): string | undefined {
-  const fused: FusibleCondition[] = [];
+  const positives: FusibleCondition[] = [];
+  const absent: string[] = [];
   const rest: MetadataFilter[] = [];
   const fields = new Set<string>();
-  let positives = 0;
   for (const operand of operands) {
-    const absent = operand.operator === "exists" && !operand.value;
-    if (isFusible(operand) && !fields.has(operand.field) && (absent || positives < MAX_FUSED_POSITIVES)) {
-      fields.add(operand.field);
-      fused.push(operand);
-      if (!absent) positives++;
-    } else {
+    if (!isFusible(operand) || fields.has(operand.field)) {
       rest.push(operand);
+      continue;
     }
+    fields.add(operand.field);
+    if (operand.operator === "exists" && !operand.value) absent.push(operand.field);
+    else positives.push(operand);
   }
-  if (fused.length < 2) return undefined;
+  if (positives.length + absent.length < 2) return undefined;
 
-  const columns = DOCUMENT_VALUE_COLUMNS;
-  let bit = 0;
-  const cases = fused.map(condition => {
-    if (condition.operator === "exists") {
-      params.push(condition.field);
-      return `WHEN mv.key = ? THEN ${condition.value ? 1 << bit++ : ABSENT_KEY_BIT}`;
-    }
-    const columnSql = buildOperandColumnSql(columns, condition.value, condition.caseInsensitive);
-    params.push(condition.field, bindOperand(condition.value, condition.caseInsensitive));
-    return `WHEN mv.key = ? AND ${columns.type} = '${valueTypeOf(condition.value)}' AND ${columnSql} = ? THEN ${1 << bit++}`;
-  });
-  const fusedSql = `(SELECT COALESCE(SUM(DISTINCT CASE ${cases.join(" ")} ELSE 0 END), 0) ` +
-    `FROM document_metadata_values mv WHERE mv.document_id = ${target.alias}.id) = ${(1 << positives) - 1}`;
+  const rowsSql = `FROM document_metadata_values mv WHERE mv.document_id = ${target.alias}.id`;
+  const absentKeysSql = absent.map(() => "?").join(", ");
+  let fusedSql: string;
+  if (positives.length === 0) {
+    params.push(...absent);
+    fusedSql = `NOT EXISTS (SELECT 1 ${rowsSql} AND +mv.key IN (${absentKeysSql}))`;
+  } else {
+    const columns = DOCUMENT_VALUE_COLUMNS;
+    const cases = positives.map((condition, index) => {
+      if (condition.operator === "exists") {
+        params.push(condition.field);
+        return `WHEN mv.key = ? THEN ${index + 1}`;
+      }
+      const columnSql = buildOperandColumnSql(columns, condition.value, condition.caseInsensitive);
+      params.push(condition.field, bindOperand(condition.value, condition.caseInsensitive));
+      return `WHEN mv.key = ? AND ${columns.type} = '${valueTypeOf(condition.value)}' AND ${columnSql} = ? THEN ${index + 1}`;
+    });
+    params.push(...absent);
+    const absentSql = absent.length === 0 ? "" : ` AND COUNT(CASE WHEN mv.key IN (${absentKeysSql}) THEN 1 END) = 0`;
+    fusedSql = `EXISTS (SELECT 1 ${rowsSql} GROUP BY mv.document_id HAVING COUNT(DISTINCT CASE ${cases.join(" ")} END) = ${positives.length}${absentSql})`;
+  }
   return `(${[fusedSql, ...rest.map(operand => compileFilterNode(operand, target, params))].join(" AND ")})`;
 }
 
