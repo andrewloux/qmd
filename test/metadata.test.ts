@@ -4,9 +4,13 @@
 
 import { describe, test, expect } from "vitest";
 import {
+  askMetadataSource,
   extractDocumentMetadata,
+  normalizeSourceMetadata,
   METADATA_EXTRACTION_VERSION,
   METADATA_LIMITS,
+  type DocumentMetadata,
+  type DocumentMetadataSource,
 } from "../src/metadata.js";
 
 function buildDoc(frontmatterYaml: string, body: string = "# Title\n\nBody text.\n"): string {
@@ -202,5 +206,137 @@ describe("extractDocumentMetadata", () => {
       "doc.md",
     );
     expect(extraction.metadata).toEqual({ published: "2024-01-15" });
+  });
+});
+
+/** A JavaScript caller's source, whose answer the TypeScript signature cannot check. */
+function untypedSource(answer: (document: Parameters<DocumentMetadataSource>[0]) => unknown): DocumentMetadataSource {
+  return answer as DocumentMetadataSource;
+}
+
+/** 63 full-length values plus one padded value: canonical JSON of exactly `bytes` UTF-8 bytes. */
+function answerWithJsonBytes(bytes: number): Record<string, string> {
+  const answer: Record<string, string> = {};
+  for (let index = 0; index < METADATA_LIMITS.maxKeys - 1; index++) {
+    answer[`k${String(index).padStart(2, "0")}`] = "x".repeat(METADATA_LIMITS.maxStringLength);
+  }
+  answer["last"] = "";
+  answer["last"] = "x".repeat(bytes - Buffer.byteLength(JSON.stringify(answer), "utf-8"));
+  return answer;
+}
+
+describe("normalizeSourceMetadata", () => {
+  test("returns detached canonical metadata for valid answers", () => {
+    const topics = ["b", "a", "b"];
+    const extraction = normalizeSourceMetadata({ topics, priority: 3, reviewed: false });
+    topics.push("c");
+    expect(extraction).toEqual({
+      metadata: { topics: ["b", "a"], priority: 3, reviewed: false },
+      extractionVersion: METADATA_EXTRACTION_VERSION,
+    });
+
+    const nullPrototype: Record<string, string> = Object.create(null);
+    nullPrototype["status"] = "ok";
+    const atBound = answerWithJsonBytes(METADATA_LIMITS.maxFrontmatterBytes);
+    const rows: [name: string, answer: unknown, metadata: DocumentMetadata][] = [
+      ["empty map", {}, {}],
+      ["null prototype", nullPrototype, { status: "ok" }],
+      ["frozen", Object.freeze({ tags: Object.freeze(["x", "y"]) }), { tags: ["x", "y"] }],
+      ["string then", { then: "x" }, { then: "x" }],
+      ["aggregate JSON at the bound", atBound, { ...atBound }],
+    ];
+    for (const [name, answer, metadata] of rows) {
+      expect({ name, extraction: normalizeSourceMetadata(answer) })
+        .toEqual({ name, extraction: { metadata, extractionVersion: METADATA_EXTRACTION_VERSION } });
+    }
+  });
+
+  test("turns each invalid answer into empty metadata and one bounded error line", () => {
+    const rows: [name: string, answer: unknown, error: RegExp][] = [
+      ["undefined", undefined, /expected a plain object, received undefined$/],
+      ["null", null, /expected a plain object, received null$/],
+      ["array", [{ status: "ok" }], /expected a plain object, received array$/],
+      ["Map", new Map([["author", "human"]]), /expected a plain object, received Map$/],
+      ["Date", new Date(0), /expected a plain object, received Date$/],
+      ["string", "author: human", /expected a plain object, received string$/],
+      ["function", () => ({ status: "ok" }), /expected a plain object, received function$/],
+      ["null value", { a: null }, /null is not supported/],
+      ["empty array", { a: [] }, /empty arrays are not supported/],
+      ["mixed array", { a: [1, "x"] }, /mixed-type arrays are not supported/],
+      ["nested array", { a: [[1]] }, /nested arrays are not supported/],
+      ["NaN", { a: Number.NaN }, /numbers must be finite/],
+      ["nested object", { a: {} }, /unsupported value type/],
+      ["function value", { a: () => 1 }, /unsupported value type/],
+      ["65 keys", Object.fromEntries(Array.from({ length: METADATA_LIMITS.maxKeys + 1 }, (_, i) => [`k${i}`, 1])), /65 keys \(max 64\)/],
+      ["129-byte key", { ["k".repeat(METADATA_LIMITS.maxKeyBytes + 1)]: 1 }, /key exceeds 128 bytes/],
+      ["control-character key", { "a\u0007b": 1 }, /control characters/],
+      ["1,025-unit string", { a: "v".repeat(METADATA_LIMITS.maxStringLength + 1) }, /string exceeds 1024 characters/],
+      ["129-value array", { a: Array.from({ length: METADATA_LIMITS.maxArrayLength + 1 }, (_, i) => i) }, /array exceeds 128 values/],
+      ["aggregate JSON past the bound", answerWithJsonBytes(METADATA_LIMITS.maxFrontmatterBytes + 1), /metadata JSON exceeds 65536 bytes$/],
+      ["truncated message", { ["k".repeat(METADATA_LIMITS.maxKeyBytes)]: null }, /null is not supported.*\.\.\.$/],
+    ];
+    for (const [name, answer, error] of rows) {
+      const extraction = normalizeSourceMetadata(answer);
+      expect({ name, extraction }).toEqual({
+        name,
+        extraction: {
+          metadata: {},
+          error: expect.stringMatching(/^metadata source: [^\n]*$/),
+          extractionVersion: METADATA_EXTRACTION_VERSION,
+        },
+      });
+      expect({ name, error: extraction.error }).toEqual({ name, error: expect.stringMatching(error) });
+      expect(extraction.error!.length).toBeLessThanOrEqual(METADATA_LIMITS.maxErrorLength);
+    }
+  });
+});
+
+describe("askMetadataSource", () => {
+  const document = { collection: "notes", path: "sub/a.md", hash: "c0ffee" };
+
+  test("passes collection, path and hash, and normalizes a synchronous answer", () => {
+    const asked: Parameters<DocumentMetadataSource>[0][] = [];
+    const extraction = askMetadataSource((sourceDocument) => {
+      asked.push(sourceDocument);
+      return { author: "human" };
+    }, document);
+    expect(asked).toEqual([document]);
+    expect(extraction).toEqual({ metadata: { author: "human" }, extractionVersion: METADATA_EXTRACTION_VERSION });
+  });
+
+  test("rejects a throwing source with the collection, path and cause", () => {
+    const failure = new Error("source map has no row");
+    let thrown: unknown;
+    try {
+      askMetadataSource(() => { throw failure; }, document);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe("Metadata source failed for notes/sub/a.md: source map has no row");
+    expect((thrown as Error).cause).toBe(failure);
+  });
+
+  test("rejects thenable answers and handles their later rejections", async () => {
+    const unhandled: unknown[] = [];
+    const recordUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", recordUnhandled);
+    try {
+      const thenableSources = [
+        untypedSource(async () => ({ status: "ok" })),
+        untypedSource(() => Promise.reject(new Error("late rejection"))),
+        untypedSource(() => ({ then: (_resolve: unknown, reject: (reason: unknown) => void) => reject(new Error("late thenable")) })),
+      ];
+      for (const source of thenableSources) {
+        expect(() => askMetadataSource(source, document)).toThrow(TypeError);
+        expect(() => askMetadataSource(source, document)).toThrow(
+          "Metadata source returned a thenable for notes/sub/a.md. DocumentMetadataSource must return metadata synchronously.",
+        );
+      }
+      await new Promise(resolve => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", recordUnhandled);
+    }
   });
 });

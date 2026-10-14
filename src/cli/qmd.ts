@@ -35,7 +35,8 @@ import {
   hashContent,
   extractTitle,
   formatDocForEmbedding,
-  getEmbeddingFingerprint,
+  getEmbeddingChunkStrategy,
+  getIndexEmbeddingFingerprint,
   chunkDocumentByTokens,
   clearCache,
   getCacheKey,
@@ -87,7 +88,6 @@ import {
   scanWriteBatch,
   REINDEX_MAX_FILE_SIZE,
   generateEmbeddings,
-  maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
   type ReindexResult,
   type ChunkStrategy,
@@ -2408,9 +2408,10 @@ async function vectorIndex(
       console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
     }
 
-    // Check if there's work to do before starting
-    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
-    if (hashesToEmbed === 0 && !force) {
+    // Check if there's work to do before starting. An explicit strategy always
+    // reaches generateEmbeddings, which records it when nothing is pending.
+    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model, batchOptions?.chunkStrategy);
+    if (hashesToEmbed === 0 && !force && batchOptions?.chunkStrategy === undefined) {
       console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
       closeDb();
       return;
@@ -3383,7 +3384,7 @@ function parseCLI() {
       "no-gpu": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
-      "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
+      "chunk-strategy": { type: "string" },  // "regex" or "auto" (AST for code files); embed records it for the index
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -3977,7 +3978,9 @@ function showHelp(): void {
   console.log("                                e.g. '{\"field\":\"status\",\"operator\":\"eq\",\"value\":\"published\"}'");
   console.log("");
   console.log("Embed/query options:");
-  console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
+  console.log("  --chunk-strategy <auto|regex> - Chunking mode; auto uses AST for code files");
+  console.log("                                embed records it for the index; without it, embed keeps the recorded mode (regex for a new index)");
+  console.log("                                query applies it to that query only (default: regex)");
   console.log("  --timeout <minutes>          - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("");
   console.log("Multi-get options:");
@@ -4260,15 +4263,16 @@ export async function checkEmbeddingVectorSamples(db: Database, model: string, f
 
   const threshold = 0.0001;
   const mismatches: string[] = [];
+  const chunkStrategy = getEmbeddingChunkStrategy(db);
 
   await withLLMSession(async (session) => {
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
-      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
-      // Sequence numbers identify stored vectors, but earlier chunks can split
-      // differently after a tokenizer/chunker change. Compare the saved passage.
-      const chunk = chunks.find(chunk => chunk.pos === sample.pos);
-      if (!chunk) {
+      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, chunkStrategy, session.signal);
+      // Select by sequence and check its saved position. Token re-cutting can
+      // give two sequences the same start.
+      const chunk = chunks[sample.seq];
+      if (!chunk || chunk.pos !== sample.pos) {
         mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
         continue;
       }
@@ -4444,7 +4448,7 @@ async function showDoctor(): Promise<void> {
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
   const embedModel = activeModels.embed;
-  const fingerprint = getEmbeddingFingerprint(embedModel);
+  const fingerprint = getIndexEmbeddingFingerprint(db, embedModel);
   const nextSteps: string[] = [];
 
   console.log(`${c.bold}QMD Doctor${c.reset}\n`);
@@ -4475,15 +4479,6 @@ async function showDoctor(): Promise<void> {
   checkModelCache(activeModels, nextSteps);
 
   await runDoctorDeviceChecks(nextSteps);
-
-  try {
-    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
-    if (adoption.checked || adoption.adopted > 0) {
-      doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
-    }
-  } catch (error) {
-    doctorCheck("legacy fingerprint adoption", false, error instanceof Error ? error.message : String(error));
-  }
 
   try {
     const pending = getHashesNeedingEmbedding(db, undefined, embedModel);

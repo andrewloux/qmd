@@ -469,6 +469,10 @@ function compileFilterNode(filter: MetadataFilter, target: FilterTarget, params:
   switch (filter.operator) {
     case "and":
     case "or": {
+      if (filter.operator === "and" && target.scope === "candidates") {
+        const fused = compileFusedConditions(filter.operands, target, params);
+        if (fused !== undefined) return fused;
+      }
       const joiner = filter.operator === "and" ? " AND " : " OR ";
       return `(${filter.operands.map(operand => compileFilterNode(operand, target, params)).join(joiner)})`;
     }
@@ -551,6 +555,79 @@ function compileFilterNode(filter: MetadataFilter, target: FilterTarget, params:
       return buildConditionSql(target, "byDocument", `${columns.type} = 'string' AND ${textSql}`);
     }
   }
+}
+
+/** A condition one scan of a document's rows can decide: an `eq` or an `exists`. */
+type FusibleCondition =
+  | (Extract<MetadataCondition, { operator: "eq" | "ne" }> & { operator: "eq" })
+  | Extract<MetadataCondition, { operator: "exists" }>;
+
+function isFusible(operand: MetadataFilter): operand is FusibleCondition {
+  return operand.operator === "eq" || operand.operator === "exists";
+}
+
+/**
+ * An `and` over candidates whose `eq` and `exists` operands, at most one per
+ * field, become one correlated aggregate over the document's own rows, read
+ * through the primary key, where each operand alone would take its own
+ * subquery. The positive operands (`eq`, `exists: true`) are numbered 1..P,
+ * and a row that satisfies operand i yields i. The document passes when its
+ * rows yield P distinct numbers and none of its rows sits under an
+ * `exists: false` key; `COUNT(DISTINCT ...)` counts an operand once however
+ * many array elements satisfy it. With no positive operand, the absent keys
+ * take one `NOT EXISTS`. The other operands, later operands on a fused field
+ * among them, compile as usual beside it. Returns undefined when fewer than
+ * two operands fuse.
+ *
+ * | operands | rows of the document | numbers | absent-key rows | passes |
+ * |---|---|---|---|---|
+ * | status eq "a", topics exists | status "a", topics "x", topics "y" | 1, 2 | 0 | yes |
+ * | status eq "a", topics exists | status "b", topics "x" | 2 | 0 | no |
+ * | status eq "a", draft exists false | status "a" | 1 | 0 | yes |
+ * | status eq "a", draft exists false | status "a", draft true | 1 | 1 | no |
+ */
+function compileFusedConditions(
+  operands: readonly MetadataFilter[],
+  target: FilterTarget,
+  params: (string | number)[],
+): string | undefined {
+  const positives: FusibleCondition[] = [];
+  const absent: string[] = [];
+  const rest: MetadataFilter[] = [];
+  const fields = new Set<string>();
+  for (const operand of operands) {
+    if (!isFusible(operand) || fields.has(operand.field)) {
+      rest.push(operand);
+      continue;
+    }
+    fields.add(operand.field);
+    if (operand.operator === "exists" && !operand.value) absent.push(operand.field);
+    else positives.push(operand);
+  }
+  if (positives.length + absent.length < 2) return undefined;
+
+  const rowsSql = `FROM document_metadata_values mv WHERE mv.document_id = ${target.alias}.id`;
+  const absentKeysSql = absent.map(() => "?").join(", ");
+  let fusedSql: string;
+  if (positives.length === 0) {
+    params.push(...absent);
+    fusedSql = `NOT EXISTS (SELECT 1 ${rowsSql} AND +mv.key IN (${absentKeysSql}))`;
+  } else {
+    const columns = DOCUMENT_VALUE_COLUMNS;
+    const cases = positives.map((condition, index) => {
+      if (condition.operator === "exists") {
+        params.push(condition.field);
+        return `WHEN mv.key = ? THEN ${index + 1}`;
+      }
+      const columnSql = buildOperandColumnSql(columns, condition.value, condition.caseInsensitive);
+      params.push(condition.field, bindOperand(condition.value, condition.caseInsensitive));
+      return `WHEN mv.key = ? AND ${columns.type} = '${valueTypeOf(condition.value)}' AND ${columnSql} = ? THEN ${index + 1}`;
+    });
+    params.push(...absent);
+    const absentSql = absent.length === 0 ? "" : ` AND COUNT(CASE WHEN mv.key IN (${absentKeysSql}) THEN 1 END) = 0`;
+    fusedSql = `EXISTS (SELECT 1 ${rowsSql} GROUP BY mv.document_id HAVING COUNT(DISTINCT CASE ${cases.join(" ")} END) = ${positives.length}${absentSql})`;
+  }
+  return `(${[fusedSql, ...rest.map(operand => compileFilterNode(operand, target, params))].join(" AND ")})`;
 }
 
 /**

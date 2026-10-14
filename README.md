@@ -334,6 +334,11 @@ const expanded = await store.expandQuery("auth flow", { intent: "user login" })
 const results4 = await store.search({ queries: expanded })
 ```
 
+`searchCandidates()` admits distinct metadata groups before rank fusion and
+returns contribution traces and coverage. See [grouped candidate retrieval](docs/CANDIDATE-SEARCH.md)
+and [source locations and configurable passages](docs/SEARCH-LOCATIONS.md).
+`inspectVectorIndex()` supplies an explicit [structural publication check](docs/VECTOR-INSPECTION.md).
+
 #### Retrieval
 
 ```typescript
@@ -414,7 +419,7 @@ const result = await store.update({
 // Generate vector embeddings
 const embedResult = await store.embed({
   force: false,           // true to re-embed everything
-  chunkStrategy: "auto",  // "regex" (default) or "auto" (AST for code files)
+  chunkStrategy: "auto",  // recorded for the index; omit to keep it ("regex" for a new index)
   onProgress: ({ current, total, collection }) => {
     console.log(`Embedding ${current}/${total}`)
   },
@@ -698,12 +703,17 @@ positions. This produces higher-quality chunks and better search results for
 codebases. Markdown and other file types always use regex-based chunking
 regardless of strategy.
 
-The default is `regex` (existing behavior). Use `--chunk-strategy auto` to
-opt in. Run `qmd status` to verify which grammars are available.
+`qmd embed --chunk-strategy auto` records `auto` as the index's chunk
+strategy, and later `qmd embed` runs without the flag keep it. An index without
+a recorded strategy uses `regex`. Changing the strategy marks vectors under
+the previous strategy pending, because vectors are stored per content hash.
+A scoped run rebuilds the selected collection; the remaining old-strategy
+hashes stay pending. `qmd query --chunk-strategy` applies to that query only.
+Run `qmd status` to verify which grammars are available.
 
-> **Note:** Tree-sitter grammars are optional dependencies. If they are not
-> installed, `--chunk-strategy auto` falls back to regex-only chunking
-> automatically. Tested on both Node.js and Bun.
+> **Note:** Tree-sitter grammars supply AST boundaries for supported code files.
+> An unavailable grammar makes `--chunk-strategy auto` use regex chunking for
+> that language. Tested on both Node.js and Bun.
 
 ### Context Management
 
@@ -1185,7 +1195,25 @@ const nextPage = await store.listMetadata({ keyLimit: 50, keyOffset: 50 })
 
 `filter` is a `MetadataFilter` and `match` is a `MetadataMatch`. Both are `MetadataPredicate<Condition>`, the one recursive grammar over the conditions each record admits, so a document-only condition (`exists`, `all`, or a metadata key as the `field`) is a type error in a match as well as a runtime one. An option outside its domain throws `MetadataOptionError`, and a `filter` and `match` that together bind more SQL parameters than one statement allows throw `MetadataBindingBudgetError`.
 
-The MCP `metadata` tool takes the same options with `collections` spelled as on `query`, returns the CLI text plus the result as `structuredContent`, and the MCP `status` tool lists each collection's most covered keys so an agent's first call reveals that metadata exists. `POST /metadata` accepts the same body as the tool and returns the same result (`400` on an invalid match, filter, or option).
+`getMetadataCoverage({ key, collection?, filter? })` measures one key without enumerating its vocabulary. It separates three numbers a caller needs before grouping or filtering on a key: how many documents the scope and filter admit, how many of them hold the key, and how many distinct values each stored type has. Take four current, active documents: `a.status = "draft"`, `b.status = "draft"`, `c` with no status, and `d.status = ["draft", "published"]`.
+
+```typescript
+const coverage = await store.getMetadataCoverage({ key: "status" })
+// {
+//   key: "status",
+//   eligibleDocuments: 4,  // a, b, c, d: active, current, error-free extraction, in scope, passing the filter
+//   coveredDocuments: 3,   // a, b, d hold at least one status value
+//   types: [{ type: "string", documents: 3, distinctValues: 2, multiValued: true }],
+// }
+```
+
+- `eligibleDocuments` counts what filtering can see: active documents in scope with a current, error-free metadata extraction that pass the filter. `listMetadata().documents` counts every active document in scope.
+- Extraction rejects an empty array, so a document declaring `status: []` stays outside `eligibleDocuments` until its extraction succeeds.
+- A one-element array is indexed like a scalar and leaves `multiValued` false. `d` holds two values, so `status` reports `multiValued: true`.
+- `types` has one entry per stored type, ordered by documents descending, then type name ascending. `distinctValues` compares values in the type's own column, so `"1"` and `1` are two types with one value each.
+- `collection` and `filter` behave as in `listMetadata`, and the result comes from one snapshot. A key a filter `field` could not name throws `MetadataOptionError`.
+
+The MCP `metadata` tool takes `listMetadata`'s options with `collections` spelled as on `query`, returns the CLI text plus the result as `structuredContent`, and the MCP `status` tool lists each collection's most covered keys so an agent's first call reveals that metadata exists. `POST /metadata` accepts the same body as the tool and returns the same result (`400` on an invalid match, filter, or option).
 
 ### Output Format
 

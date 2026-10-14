@@ -51,6 +51,7 @@ import {
   type DocumentExcludedByIgnore,
   type DocumentLookupError,
   type SearchResult,
+  type CompactSearchResult,
   type HybridQueryResult,
   type HybridQueryOptions,
   type HybridQueryExplain,
@@ -69,8 +70,11 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import { searchCandidates, type CandidateSearchOptions, type CandidateSearchResult } from "./candidate-search.js";
+import type { VectorIndexInspection } from "./vector-inspection.js";
 import type {
   DocumentMetadata,
+  DocumentMetadataSource,
   MetadataScalar,
   MetadataScalarArray,
   MetadataValue,
@@ -92,13 +96,17 @@ import {
   type MetadataEntryField,
 } from "./metadata-filter.js";
 import {
+  getMetadataCoverage as storeGetMetadataCoverage,
   listMetadata as storeListMetadata,
   MetadataBindingBudgetError,
   MetadataOptionError,
   type ListMetadataOptions,
   type ListMetadataResult,
+  type MetadataCoverageOptions,
+  type MetadataCoverageResult,
   type MetadataKeySummary,
   type MetadataKeyTypeSummary,
+  type MetadataTypeCoverage,
   type MetadataValueCount,
   type MetadataKeyOverview,
 } from "./metadata-store.js";
@@ -118,12 +126,30 @@ import {
 } from "./collections.js";
 
 // Re-export types for SDK consumers
+export type { VectorIndexInspection, VectorPartitionState } from "./vector-inspection.js";
+export type {
+  CandidateSearchOptions,
+  CandidateSearchResult,
+  CandidateHit,
+  CandidateGroup,
+  CandidateMatch,
+  CandidateLegCoverage,
+} from "./candidate-search.js";
+export type {
+  SearchLocation,
+  LexicalLocation,
+  DocumentLocationRef,
+  Utf16Span,
+  PassageBudget,
+  PassageWindow,
+} from "./search-locations.js";
 export type {
   DocumentResult,
   DocumentNotFound,
   DocumentExcludedByIgnore,
   DocumentLookupError,
   SearchResult,
+  CompactSearchResult,
   HybridQueryResult,
   HybridQueryOptions,
   HybridQueryExplain,
@@ -146,6 +172,7 @@ export type {
 // Re-export metadata and metadata-filter types shared by every search surface
 export type {
   DocumentMetadata,
+  DocumentMetadataSource,
   MetadataScalar,
   MetadataScalarArray,
   MetadataValue,
@@ -163,7 +190,7 @@ export type {
 };
 export { parseMetadataFilter, parseMetadataMatch, MetadataFilterError };
 
-// Re-export metadata discovery types (listMetadata() and status metadata keys)
+// Re-export metadata discovery types (listMetadata(), getMetadataCoverage(), and status metadata keys)
 export type {
   ListMetadataOptions,
   ListMetadataResult,
@@ -171,6 +198,9 @@ export type {
   MetadataKeyTypeSummary,
   MetadataValueCount,
   MetadataKeyOverview,
+  MetadataCoverageOptions,
+  MetadataCoverageResult,
+  MetadataTypeCoverage,
 };
 export { MetadataBindingBudgetError, MetadataOptionError };
 
@@ -212,6 +242,12 @@ export type UpdateResult = {
   /** Vector rows copied into the partition of a collection that gained an already-embedded hash. */
   vectorsCopied: number;
   needsEmbedding: number;
+  /**
+   * Documents whose metadata failed extraction this pass: invalid
+   * `qmd.metadata` frontmatter, or an invalid `metadata` source answer. Each
+   * keeps empty metadata and stays out of filtered search.
+   */
+  metadataErrors: number;
 };
 
 /**
@@ -252,6 +288,16 @@ export interface LexSearchOptions {
   collection?: string | string[];
   /** Metadata filter — every returned result satisfies it */
   filter?: MetadataFilter;
+  /** Whether to include document body text on each hit (default: true). */
+  includeBody?: boolean;
+  /**
+   * With `includeBody: false`, whether to report each hit's body length
+   * (default: true). False skips the content table and returns
+   * `CompactSearchResult` hits.
+   */
+  includeBodyLength?: boolean;
+  /** Whether to resolve collection/path context on each hit (default: true). */
+  includeContext?: boolean;
 }
 
 /**
@@ -311,7 +357,11 @@ export interface QMDStore {
   /** Full search: query expansion + multi-signal retrieval + LLM reranking */
   search(options: SearchOptions): Promise<HybridQueryResult[]>;
 
+  /** Retrieve metadata groups with per-leg admission and coverage accounting. */
+  searchCandidates(options: CandidateSearchOptions): Promise<CandidateSearchResult>;
+
   /** BM25 keyword search (fast, no LLM) */
+  searchLex(query: string, options: LexSearchOptions & { includeBody: false; includeBodyLength: false }): Promise<CompactSearchResult[]>;
   searchLex(query: string, options?: LexSearchOptions): Promise<SearchResult[]>;
 
   /** Vector similarity search (embedding model, no reranking) */
@@ -361,6 +411,29 @@ export interface QMDStore {
    */
   listMetadata(options?: ListMetadataOptions): Promise<ListMetadataResult>;
 
+  /**
+   * Measure one metadata key without enumerating its values.
+   * `eligibleDocuments` counts the active documents in scope with a current,
+   * error-free metadata extraction that pass `filter`, whether or not they
+   * hold the key (listMetadata's `documents` counts every active document in
+   * scope); `coveredDocuments` counts those holding at least one value for it;
+   * `types` gives per stored type the documents, binary-distinct values, and
+   * whether any document holds more than one value. A one-element array counts
+   * as a scalar and leaves multiValued false. Extraction rejects an empty
+   * array, so that document stays outside `eligibleDocuments` until its
+   * extraction succeeds. For current, active documents a.status="draft",
+   * b.status="draft", c with no status, and d.status=["draft","published"],
+   * `getMetadataCoverage({ key: "status" })` returns eligibleDocuments 4,
+   * coveredDocuments 3, and one string type with
+   * documents 3, distinctValues 2, multiValued true. `collection` and `filter`
+   * mean what they mean for listMetadata, and the result comes from one
+   * database snapshot. Throws MetadataOptionError for a key a filter `field`
+   * could not name, MetadataFilterError for an invalid filter, and
+   * MetadataBindingBudgetError when the filter and key together bind more SQL
+   * parameters than one statement allows.
+   */
+  getMetadataCoverage(options: MetadataCoverageOptions): Promise<MetadataCoverageResult>;
+
   /** Get names of collections included by default in queries */
   getDefaultCollectionNames(): Promise<string[]>;
 
@@ -387,6 +460,18 @@ export interface QMDStore {
   update(options?: {
     collections?: string[];
     onProgress?: (info: UpdateProgress) => void;
+    /**
+     * Supplies each admitted nonblank document's complete metadata, replacing
+     * `qmd.metadata` frontmatter for this update. Unchanged files are asked
+     * too, so a metadata-only change needs no file edit.
+     *
+     * QMD applies the frontmatter limits and bounds the answer's canonical
+     * JSON at 64 KiB. An invalid answer stores empty metadata plus an error
+     * and counts in `metadataErrors`. A throw or a thenable answer rejects
+     * the update and rolls back its open write batch; earlier batches stay
+     * committed. A later update without `metadata` re-extracts frontmatter.
+     */
+    metadata?: DocumentMetadataSource;
   }): Promise<UpdateResult>;
 
   /** Generate vector embeddings for documents that need them */
@@ -398,6 +483,11 @@ export interface QMDStore {
     maxDocsPerBatch?: number;
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
+    /**
+     * Wall-clock cap in milliseconds for the whole embed session; batches left at expiry are
+     * skipped. Defaults to 30 minutes; a value <= 0 disables the cap.
+     */
+    maxDurationMs?: number;
     onProgress?: (info: EmbedProgress) => void;
   }): Promise<EmbedResult>;
 
@@ -408,6 +498,9 @@ export interface QMDStore {
 
   /** Get index health info (stale embeddings, etc.) */
   getIndexHealth(): Promise<IndexHealthInfo>;
+
+  /** Inspect recorded vector generations and partition peers in one snapshot. */
+  inspectVectorIndex(options?: { model?: string }): Promise<VectorIndexInspection>;
 
   // ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -529,9 +622,14 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
+    searchCandidates: opts => searchCandidates(internal, opts),
     searchLex: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
-      return internal.searchFTS(q, opts?.limit, opts?.collection, filter);
+      const retrieval =
+        opts?.includeBody !== undefined || opts?.includeBodyLength !== undefined || opts?.includeContext !== undefined
+          ? { includeBody: opts.includeBody, includeBodyLength: opts.includeBodyLength, includeContext: opts.includeContext }
+          : undefined;
+      return internal.searchFTS(q, opts?.limit, opts?.collection, filter, retrieval);
     },
     searchVector: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
@@ -573,6 +671,10 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       match: opts?.match === undefined ? undefined : parseMetadataMatch(opts.match),
       filter: opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter),
     }),
+    getMetadataCoverage: async (opts) => storeGetMetadataCoverage(db, {
+      ...opts,
+      filter: opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter),
+    }),
     getDefaultCollectionNames: async () => {
       const collections = storeListCollections(db);
       return collections.filter(c => c.includeByDefault).map(c => c.name);
@@ -604,6 +706,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Indexing — reads collections from SQLite
     update: async (updateOpts) => {
+      // One read: a getter runs once, and reassigning the option mid-update
+      // leaves every collection of this update on the same source.
+      const metadataSource = updateOpts?.metadata;
+      if (metadataSource !== undefined && typeof metadataSource !== "function") {
+        throw new TypeError(`update() metadata must be a function, received ${metadataSource === null ? "null" : typeof metadataSource}`);
+      }
+
       const collections = getStoreCollections(db);
       const filtered = updateOpts?.collections
         ? collections.filter(c => updateOpts.collections!.includes(c.name))
@@ -611,7 +720,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
       internal.clearCache();
 
-      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
+      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0, totalMetadataErrors = 0;
 
       for (const col of filtered) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
@@ -619,12 +728,14 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           onProgress: updateOpts?.onProgress
             ? (info) => updateOpts.onProgress!({ collection: col.name, ...info })
             : undefined,
+          metadataSource,
         });
         totalIndexed += result.indexed;
         totalUpdated += result.updated;
         totalUnchanged += result.unchanged;
         totalRemoved += result.removed;
         totalSkipped += result.skipped;
+        totalMetadataErrors += result.metadataErrors;
       }
 
       // A changed file rewrites its document's hash in place and strands the
@@ -646,6 +757,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         staleVectorsRemoved,
         vectorsCopied,
         needsEmbedding: internal.getHashesNeedingEmbedding(),
+        metadataErrors: totalMetadataErrors,
       };
     },
 
@@ -657,6 +769,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,
+        maxDurationMs: embedOpts?.maxDurationMs,
         onProgress: embedOpts?.onProgress,
       });
     },
@@ -664,6 +777,12 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     // Index Health
     getStatus: async () => internal.getStatus(),
     getIndexHealth: async () => internal.getIndexHealth(),
+    inspectVectorIndex: async (opts) => {
+      if (opts?.model !== undefined && (typeof opts.model !== "string" || !opts.model.trim())) {
+        throw new Error("model must be a non-empty string");
+      }
+      return internal.inspectVectorIndex(opts?.model);
+    },
 
     // Lifecycle
     close: async () => {

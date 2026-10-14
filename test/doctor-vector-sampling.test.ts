@@ -48,14 +48,73 @@ describe("doctor vector sampling", () => {
       new Float32Array(vectorMatches ? [1, 0] : [0, 1]), "model", "2026-01-01", 1, "current");
   }
 
-  test("checks the stored passage when earlier chunks shift its sequence number", async () => {
+  test("reports a mismatch when the stored passage sits at another sequence", async () => {
     await addStoredPassage(0);
-    expect((await checkEmbeddingVectorSamples(store.db, "model", "current")).ok).toBe(true);
+    const result = await checkEmbeddingVectorSamples(store.db, "model", "current");
+    expect(result.ok).toBe(false);
+    expect(result.details).toContain("chunk no longer exists");
   });
 
-  test("checks the stored passage when its old sequence is beyond today's chunk count", async () => {
+  test("reports a mismatch when the stored sequence is beyond today's chunk count", async () => {
     await addStoredPassage(100);
-    expect((await checkEmbeddingVectorSamples(store.db, "model", "current")).ok).toBe(true);
+    const result = await checkEmbeddingVectorSamples(store.db, "model", "current");
+    expect(result.ok).toBe(false);
+    expect(result.details).toContain("chunk no longer exists");
+  });
+
+  test("checks the chunk at the stored sequence when two chunks share a start", async () => {
+    let expectedText = "";
+    class EqualStartsLlm extends LlamaCpp {
+      // 2,303 tokens per 2,700 characters re-cuts each first-pass chunk into starts 0, 765, 1,530, 2,295, 2,295, ...
+      async tokenize(text: string) { return new Array(Math.ceil(text.length * 2_303 / 2_700)).fill(1); }
+      async embed(text: string) {
+        return { embedding: text === expectedText ? [1, 0] : [0, 1], model: "model" };
+      }
+    }
+    setDefaultLlamaCpp(new EqualStartsLlm());
+    const body = Array.from({ length: 1_200 }, (_, index) => `w${String(index).padStart(4, "0")}`).join("");
+    const chunks = await chunkDocumentByTokens(body);
+    expect(chunks[3]!.pos).toBe(chunks[4]!.pos);
+    expect(chunks[3]!.text).not.toBe(chunks[4]!.text);
+    expectedText = formatDocForEmbedding(chunks[4]!.text, extractTitle(body, "dense.md"), "model");
+    store.insertContent("dense", body, "2026-01-01");
+    store.insertDocument("test", "dense.md", "Dense", "dense", "2026-01-01", "2026-01-01");
+    store.ensureVecTable(2);
+    store.insertEmbedding("dense", 4, chunks[4]!.pos, new Float32Array([1, 0]), "model", "2026-01-01", chunks.length, "current");
+
+    expect(await checkEmbeddingVectorSamples(store.db, "model", "current"))
+      .toEqual({ ok: true, details: "1 sampled chunk reproduce stored vectors" });
+  });
+
+  test("reconstructs chunks with the index's stored chunk strategy", async () => {
+    let expectedText = "";
+    class QuarterTokenLlm extends LlamaCpp {
+      async tokenize(text: string) { return new Array(Math.ceil(text.length / 4)).fill(1); }
+      async embed(text: string) {
+        return { embedding: text === expectedText ? [1, 0] : [0, 1], model: "model" };
+      }
+    }
+    setDefaultLlamaCpp(new QuarterTokenLlm());
+    const body = Array.from({ length: 60 }, (_, index) => [
+      `export function handler${index}(input: string): string {`,
+      "  const value = input.trim();",
+      `  return value + "-${index}";`,
+      "}",
+      "",
+    ].join("\n")).join("\n");
+    const auto = await chunkDocumentByTokens(body, undefined, undefined, undefined, "handlers.ts", "auto");
+    const regex = await chunkDocumentByTokens(body, undefined, undefined, undefined, "handlers.ts", "regex");
+    const seq = auto.findIndex((chunk, index) => chunk.pos !== regex[index]?.pos || chunk.text !== regex[index]?.text);
+    expect(seq).toBeGreaterThanOrEqual(0);
+    expectedText = formatDocForEmbedding(auto[seq]!.text, extractTitle(body, "handlers.ts"), "model");
+    store.insertContent("code", body, "2026-01-01");
+    store.insertDocument("test", "handlers.ts", "Handlers", "code", "2026-01-01", "2026-01-01");
+    store.db.prepare(`INSERT INTO store_config (key, value) VALUES ('embedding_chunk_strategy', 'auto')`).run();
+    store.ensureVecTable(2);
+    store.insertEmbedding("code", seq, auto[seq]!.pos, new Float32Array([1, 0]), "model", "2026-01-01", auto.length, "current");
+
+    expect(await checkEmbeddingVectorSamples(store.db, "model", "current"))
+      .toEqual({ ok: true, details: "1 sampled chunk reproduce stored vectors" });
   });
 
   test("still rejects a changed vector at the matching position", async () => {

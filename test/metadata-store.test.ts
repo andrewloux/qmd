@@ -19,12 +19,17 @@ import {
   type Store,
 } from "../src/store.js";
 import {
+  initializeMetadataSchema,
   syncDocumentMetadata,
+  syncExternalDocumentMetadata,
   replaceDocumentMetadata,
   countDocumentsPendingMetadata,
   getMetadataByFilepath,
 } from "../src/metadata-store.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "../src/metadata.js";
+import { openDatabase, type Database, type SQLiteValue } from "../src/db.js";
+import { VECTOR_PARTITION_VERSION, getUserVersion, runStoreMigrations } from "../src/store-migrations.js";
+import { LEGACY_VEC_TABLE, vecLayout } from "../src/vec-layout.js";
 
 let testDir: string;
 let store: Store;
@@ -63,6 +68,13 @@ function getMetadataRow(documentId: number): { metadata_json: string; extraction
     SELECT metadata_json, extraction_version, extraction_error
     FROM document_metadata WHERE document_id = ?
   `).get(documentId) as { metadata_json: string; extraction_version: number; extraction_error: string | null } | undefined;
+}
+
+function getMetadataState(documentId: number): { source: string; metadata_json: string; extraction_error: string | null; extracted_at: string } | undefined {
+  return store.db.prepare(`
+    SELECT source, metadata_json, extraction_error, extracted_at
+    FROM document_metadata WHERE document_id = ?
+  `).get(documentId) as { source: string; metadata_json: string; extraction_error: string | null; extracted_at: string } | undefined;
 }
 
 function countValueRows(documentId: number): number {
@@ -133,6 +145,26 @@ describe("syncDocumentMetadata", () => {
     syncDocumentMetadata(store.db, documentId, "# Doc\n", "doc.md");
     expect(countValueRows(documentId)).toBe(0);
     expect(getMetadataRow(documentId)!.extraction_error).toBeNull();
+  });
+
+  test("an identical external answer keeps its row until frontmatter extraction takes the row back", async () => {
+    const content = buildDoc("qmd:\n  metadata:\n    status: draft\n", "# Doc\n");
+    const documentId = await insertDoc("notes", "doc.md", content);
+    syncDocumentMetadata(store.db, documentId, content, "doc.md");
+
+    const published = { metadata: { status: "published" }, extractionVersion: METADATA_EXTRACTION_VERSION };
+    syncExternalDocumentMetadata(store.db, documentId, published);
+    const external = getMetadataState(documentId);
+    expect(external).toMatchObject({ source: "external", metadata_json: '{"status":"published"}', extraction_error: null });
+
+    await new Promise(resolve => setTimeout(resolve, 5));
+    syncExternalDocumentMetadata(store.db, documentId, { ...published, metadata: { status: "published" } });
+    expect(getMetadataState(documentId)).toEqual(external);
+
+    // An external row is stale for frontmatter, and the re-extraction writes its origin on conflict.
+    expect(syncDocumentMetadata(store.db, documentId, content, "doc.md", { onlyIfStale: true })).not.toBeNull();
+    expect(getMetadataState(documentId)).toMatchObject({ source: "frontmatter", metadata_json: '{"status":"draft"}' });
+    expect(syncDocumentMetadata(store.db, documentId, content, "doc.md", { onlyIfStale: true })).toBeNull();
   });
 
   test("two paths sharing one content hash keep separate metadata rows", async () => {
@@ -288,5 +320,117 @@ describe("reindexCollection metadata synchronization", () => {
     removeCollection(store.db, "notes");
     expect((store.db.prepare(`SELECT COUNT(*) as c FROM document_metadata`).get() as { c: number }).c).toBe(0);
     expect((store.db.prepare(`SELECT COUNT(*) as c FROM document_metadata_values`).get() as { c: number }).c).toBe(0);
+  });
+});
+
+describe("document_metadata.source migration", () => {
+  type ColumnInfo = { name: string; dflt_value: string | null; notnull: number };
+
+  function metadataColumns(db: Database): ColumnInfo[] {
+    return db.prepare(`PRAGMA table_info(document_metadata)`).all() as ColumnInfo[];
+  }
+
+  /** Rebuild document_metadata in its layout from before metadata sources, rows included. */
+  function restorePreSourceMetadataTable(db: Database): void {
+    db.exec(`PRAGMA foreign_keys = OFF`);
+    db.exec(`
+      CREATE TABLE document_metadata_before_sources (
+        document_id INTEGER PRIMARY KEY,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        extraction_version INTEGER NOT NULL,
+        extraction_error TEXT,
+        extracted_at TEXT NOT NULL,
+        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`
+      INSERT INTO document_metadata_before_sources
+      SELECT document_id, metadata_json, extraction_version, extraction_error, extracted_at FROM document_metadata
+    `);
+    db.exec(`DROP TABLE document_metadata`);
+    db.exec(`ALTER TABLE document_metadata_before_sources RENAME TO document_metadata`);
+    db.exec(`PRAGMA foreign_keys = ON`);
+  }
+
+  async function seedFrontmatterRow(): Promise<void> {
+    const content = buildDoc("qmd:\n  metadata:\n    status: ok\n", "# Doc\n");
+    const documentId = await insertDoc("notes", "doc.md", content);
+    syncDocumentMetadata(store.db, documentId, content, "doc.md");
+  }
+
+  test("a fresh index declares source with the frontmatter default and keeps the vector user_version", () => {
+    expect(metadataColumns(store.db).find(column => column.name === "source"))
+      .toMatchObject({ dflt_value: "'frontmatter'", notnull: 1 });
+    expect(getUserVersion(store.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(() => store.db.exec(`INSERT INTO document_metadata (document_id, extraction_version, extracted_at, source) VALUES (1, 1, 'now', 'yaml')`))
+      .toThrow(/CHECK constraint failed/);
+  });
+
+  test("an index from before metadata sources gains the column at open while the vector step defers", async () => {
+    await seedFrontmatterRow();
+    restorePreSourceMetadataTable(store.db);
+    store.db.exec(`CREATE VIRTUAL TABLE ${LEGACY_VEC_TABLE} USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[3] distance_metric=cosine)`);
+    store.db.exec(`PRAGMA user_version = 1`);
+    expect(metadataColumns(store.db).map(column => column.name)).not.toContain("source");
+
+    // initializeDatabase's order on a host without sqlite-vec: metadata schema, then store migrations.
+    const withoutVec = openDatabase(store.dbPath);
+    try {
+      initializeMetadataSchema(withoutVec);
+      runStoreMigrations(withoutVec, { installFtsSyncTriggers: () => {}, sqliteVecAvailable: false });
+
+      expect(getUserVersion(withoutVec)).toBe(1);
+      expect(vecLayout(withoutVec).kind).toBe("legacy");
+      expect(withoutVec.prepare(`SELECT source, metadata_json, extraction_error FROM document_metadata`).all())
+        .toEqual([{ source: "frontmatter", metadata_json: '{"status":"ok"}', extraction_error: null }]);
+    } finally {
+      withoutVec.close();
+    }
+
+    expect(countDocumentsPendingMetadata(store.db)).toBe(0);
+    expect(getMetadataByFilepath(store.db, ["qmd://notes/doc.md"]).get("qmd://notes/doc.md")).toEqual({ status: "ok" });
+  });
+
+  test("an opener whose first check loses the race to another opener's ALTER skips its own", async () => {
+    await seedFrontmatterRow();
+    restorePreSourceMetadataTable(store.db);
+
+    const first = openDatabase(store.dbPath);
+    const second = openDatabase(store.dbPath);
+    try {
+      // The second opener adds the column between the first opener's quick
+      // check and its IMMEDIATE transaction.
+      let raced = false;
+      const racingFirst: Database = {
+        get inTransaction() { return first.inTransaction; },
+        exec: (sql: string) => first.exec(sql),
+        loadExtension: (path: string) => first.loadExtension(path),
+        transaction: first.transaction.bind(first),
+        close: () => first.close(),
+        prepare: (sql: string) => {
+          const statement = first.prepare(sql);
+          if (raced || !sql.includes("PRAGMA table_info(document_metadata)")) return statement;
+          raced = true;
+          return {
+            run: statement.run.bind(statement),
+            get: statement.get.bind(statement),
+            iterate: statement.iterate.bind(statement),
+            all: <T>(...params: SQLiteValue[]): T[] => {
+              const columnsBeforeRace = statement.all<T>(...params);
+              initializeMetadataSchema(second);
+              return columnsBeforeRace;
+            },
+          };
+        },
+      };
+
+      expect(() => initializeMetadataSchema(racingFirst)).not.toThrow();
+      expect(raced).toBe(true);
+      expect(metadataColumns(first).filter(column => column.name === "source")).toHaveLength(1);
+      expect(first.prepare(`SELECT source FROM document_metadata`).all()).toEqual([{ source: "frontmatter" }]);
+    } finally {
+      first.close();
+      second.close();
+    }
   });
 });

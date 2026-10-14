@@ -4,8 +4,8 @@
  *
  * Metadata attaches to document identity (`documents.id`), not content
  * identity: two paths can share one content hash while carrying different
- * metadata. SQLite stays a derived index — metadata is rebuilt from source
- * documents on `qmd update`, never mutated in place.
+ * metadata. SQLite stays a derived index: an update rebuilds metadata from
+ * document frontmatter or an SDK metadata source.
  *
  * `document_metadata` records extraction state per document (including
  * successful-but-empty extraction), so filtered search can distinguish
@@ -28,6 +28,9 @@ import {
 import {
   compileMetadataFilter,
   compileMetadataMatch,
+  METADATA_FILTER_LIMITS,
+  MetadataFilterError,
+  parseMetadataFilter,
   parseMetadataMatch,
   type CompiledMetadataFilter,
   type MetadataFilter,
@@ -38,6 +41,11 @@ import {
 // Schema
 // =============================================================================
 
+/** Where a document's metadata came from, stored in `document_metadata.source`. */
+export type DocumentMetadataOrigin = "frontmatter" | "external";
+
+const METADATA_SOURCE_COLUMN = `source TEXT NOT NULL DEFAULT 'frontmatter' CHECK (source IN ('frontmatter', 'external'))`;
+
 export function initializeMetadataSchema(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS document_metadata (
@@ -46,9 +54,11 @@ export function initializeMetadataSchema(db: Database): void {
       extraction_version INTEGER NOT NULL,
       extraction_error TEXT,
       extracted_at TEXT NOT NULL,
+      ${METADATA_SOURCE_COLUMN},
       FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
     )
   `);
+  ensureMetadataSourceColumn(db);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS document_metadata_values (
@@ -89,6 +99,34 @@ export function initializeMetadataSchema(db: Database): void {
   `);
 }
 
+/**
+ * Add `document_metadata.source` to an index created before metadata
+ * sources. Every existing row came from frontmatter, so the column default
+ * labels it. This check runs at every open, outside PRAGMA user_version: the
+ * vector step can defer without sqlite-vec and return before any later
+ * version step. Check and ALTER share one IMMEDIATE transaction with a
+ * double-checked read, matching applyVersionedStep, so concurrent first opens
+ * add the column once and migrated opens take no write lock.
+ */
+function ensureMetadataSourceColumn(db: Database): void {
+  if (hasMetadataSourceColumn(db)) return;
+  db.exec(`BEGIN IMMEDIATE`);
+  try {
+    if (!hasMetadataSourceColumn(db)) {
+      db.exec(`ALTER TABLE document_metadata ADD COLUMN ${METADATA_SOURCE_COLUMN}`);
+    }
+    db.exec(`COMMIT`);
+  } catch (err) {
+    db.exec(`ROLLBACK`);
+    throw err;
+  }
+}
+
+function hasMetadataSourceColumn(db: Database): boolean {
+  const columns = db.prepare(`PRAGMA table_info(document_metadata)`).all() as { name: string }[];
+  return columns.some(column => column.name === "source");
+}
+
 // =============================================================================
 // Persistence
 // =============================================================================
@@ -97,7 +135,7 @@ export function initializeMetadataSchema(db: Database): void {
  * Extract and persist metadata for one document, replacing any prior rows.
  *
  * With `onlyIfStale`, extraction is skipped when the document already has a
- * current-version extraction row — the cheap path for unchanged documents
+ * current-version frontmatter extraction row — the cheap path for unchanged documents
  * during re-index. Returns the extraction result, or null when skipped.
  */
 export function syncDocumentMetadata(
@@ -118,35 +156,69 @@ export function syncDocumentMetadata(
  * Replace a document's metadata rows atomically. A failed extraction persists
  * empty metadata plus the error, so stale metadata never survives a bad edit.
  */
-export function replaceDocumentMetadata(db: Database, documentId: number, extraction: MetadataExtractionResult): void {
+export type MetadataStatements = {
+  upsertMetadata: ReturnType<Database["prepare"]>;
+  deleteValues: ReturnType<Database["prepare"]>;
+  insertValue: ReturnType<Database["prepare"]>;
+  selectStored: ReturnType<Database["prepare"]>;
+  selectCurrent: ReturnType<Database["prepare"]>;
+};
+
+const metadataStatementsByDb = new WeakMap<Database, MetadataStatements>();
+
+function getMetadataStatements(db: Database): MetadataStatements {
+  let stmts = metadataStatementsByDb.get(db);
+  if (!stmts) {
+    stmts = {
+      upsertMetadata: db.prepare(`
+        INSERT INTO document_metadata (document_id, metadata_json, extraction_version, extraction_error, extracted_at, source)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id) DO UPDATE SET
+          metadata_json = excluded.metadata_json,
+          extraction_version = excluded.extraction_version,
+          extraction_error = excluded.extraction_error,
+          extracted_at = excluded.extracted_at,
+          source = excluded.source
+      `),
+      deleteValues: db.prepare(`DELETE FROM document_metadata_values WHERE document_id = ?`),
+      insertValue: db.prepare(`
+        INSERT INTO document_metadata_values (document_id, key, ordinal, value_type, text_value, number_value, boolean_value)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `),
+      selectStored: db.prepare(`
+        SELECT source, metadata_json, extraction_version, extraction_error
+        FROM document_metadata WHERE document_id = ?
+      `),
+      selectCurrent: db.prepare(`SELECT extraction_version, source FROM document_metadata WHERE document_id = ?`),
+    };
+    metadataStatementsByDb.set(db, stmts);
+  }
+  return stmts;
+}
+
+export function replaceDocumentMetadata(
+  db: Database,
+  documentId: number,
+  extraction: MetadataExtractionResult,
+  origin: DocumentMetadataOrigin = "frontmatter",
+): void {
+  const stmts = getMetadataStatements(db);
   const replace = db.transaction(() => {
-    db.prepare(`
-      INSERT INTO document_metadata (document_id, metadata_json, extraction_version, extraction_error, extracted_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(document_id) DO UPDATE SET
-        metadata_json = excluded.metadata_json,
-        extraction_version = excluded.extraction_version,
-        extraction_error = excluded.extraction_error,
-        extracted_at = excluded.extracted_at
-    `).run(
+    stmts.upsertMetadata.run(
       documentId,
       JSON.stringify(extraction.metadata),
       extraction.extractionVersion,
       extraction.error ?? null,
       new Date().toISOString(),
+      origin,
     );
 
-    db.prepare(`DELETE FROM document_metadata_values WHERE document_id = ?`).run(documentId);
-
-    const insertValue = db.prepare(`
-      INSERT INTO document_metadata_values (document_id, key, ordinal, value_type, text_value, number_value, boolean_value)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
+    stmts.deleteValues.run(documentId);
 
     for (const [key, value] of Object.entries(extraction.metadata)) {
       const scalars = Array.isArray(value) ? value : [value];
       scalars.forEach((scalar, ordinal) => {
-        insertValue.run(
+        stmts.insertValue.run(
           documentId,
           key,
           ordinal,
@@ -162,10 +234,37 @@ export function replaceDocumentMetadata(db: Database, documentId: number, extrac
   replace();
 }
 
+/**
+ * Persist one metadata source answer as the document's external metadata.
+ * An answer equal to the stored external row keeps that row, its value rows
+ * and its `extracted_at`.
+ */
+export function syncExternalDocumentMetadata(db: Database, documentId: number, extraction: MetadataExtractionResult): void {
+  const stmts = getMetadataStatements(db);
+  const stored = stmts.selectStored.get(documentId) as {
+    source: DocumentMetadataOrigin;
+    metadata_json: string;
+    extraction_version: number;
+    extraction_error: string | null;
+  } | undefined;
+
+  if (
+    stored?.source === "external"
+    && stored.metadata_json === JSON.stringify(extraction.metadata)
+    && stored.extraction_version === extraction.extractionVersion
+    && stored.extraction_error === (extraction.error ?? null)
+  ) {
+    return;
+  }
+  replaceDocumentMetadata(db, documentId, extraction, "external");
+}
+
+// A row from a metadata source is stale for frontmatter extraction, so a
+// default update re-reads the file and re-extracts it.
 function isDocumentMetadataCurrent(db: Database, documentId: number): boolean {
-  const row = db.prepare(`SELECT extraction_version FROM document_metadata WHERE document_id = ?`)
-    .get(documentId) as { extraction_version: number } | undefined;
-  return row?.extraction_version === METADATA_EXTRACTION_VERSION;
+  const row = getMetadataStatements(db).selectCurrent
+    .get(documentId) as { extraction_version: number; source: DocumentMetadataOrigin } | undefined;
+  return row?.extraction_version === METADATA_EXTRACTION_VERSION && row.source === "frontmatter";
 }
 
 // =============================================================================
@@ -323,6 +422,45 @@ export interface MetadataOverview {
   keys: MetadataKeyOverview[];
 }
 
+export interface MetadataCoverageOptions {
+  /** The one metadata key measured, matched exactly. */
+  key: string;
+  /** Restrict to these collections. Undefined means every collection in the index. */
+  collection?: string | string[];
+  /** Count only documents matching this filter. Same AST as search. */
+  filter?: MetadataFilter;
+}
+
+/** One stored value type of the measured key. */
+export interface MetadataTypeCoverage {
+  type: MetadataValueType;
+  /** Distinct documents holding a value of this type for the key. */
+  documents: number;
+  /** Binary-distinct values of this type, compared in the type's own column. */
+  distinctValues: number;
+  /**
+   * True when any document holds more than one value of this type for the key.
+   * A one-element array is indistinguishable from a scalar in the index.
+   */
+  multiValued: boolean;
+}
+
+export interface MetadataCoverageResult {
+  key: string;
+  /**
+   * Active documents in scope with a current, error-free metadata extraction
+   * that pass `filter`, whether or not they hold the key. listMetadata's
+   * `documents` counts every active document in scope instead. A document
+   * whose extraction failed, such as one declaring an empty array, stays
+   * outside until extraction succeeds.
+   */
+  eligibleDocuments: number;
+  /** Those documents holding at least one indexed value for the key. */
+  coveredDocuments: number;
+  /** One entry per stored value type, by documents descending then type. */
+  types: MetadataTypeCoverage[];
+}
+
 export const DEFAULT_METADATA_KEY_LIMIT = 50;
 export const DEFAULT_METADATA_VALUE_LIMIT = 10;
 
@@ -335,7 +473,7 @@ export const DEFAULT_METADATA_VALUE_LIMIT = 10;
  */
 export const METADATA_SQL_BINDING_BUDGET = 30_000;
 
-/** Raised by listMetadata when an option is outside its domain. */
+/** Raised by listMetadata and getMetadataCoverage when an option is outside its domain. */
 export class MetadataOptionError extends Error {
   readonly option: string;
 
@@ -346,13 +484,17 @@ export class MetadataOptionError extends Error {
   }
 }
 
-/** Raised by listMetadata when `filter` and `match` together bind more SQL parameters than the budget. */
+/**
+ * Raised by listMetadata when `filter` and `match` together, and by
+ * getMetadataCoverage when `filter` and the key, bind more SQL parameters than
+ * the budget.
+ */
 export class MetadataBindingBudgetError extends Error {
   readonly bindings: number;
   readonly budget: number;
 
-  constructor(bindings: number, budget: number) {
-    super(`filter and match together bind ${bindings} SQL parameters, over the budget of ${budget}. Shorten their membership lists.`);
+  constructor(bindings: number, budget: number, bindingSource: "filter and match" | "filter and key" = "filter and match") {
+    super(`${bindingSource} together bind ${bindings} SQL parameters, over the budget of ${budget}. Shorten their membership lists.`);
     this.name = "MetadataBindingBudgetError";
     this.bindings = bindings;
     this.budget = budget;
@@ -507,6 +649,79 @@ function readMetadataReport(
 }
 
 /**
+ * Measure one metadata key over the documents in scope: how many documents
+ * filtering admits, how many of them hold the key, and per stored type the
+ * documents, distinct values, and whether a document holds multiple
+ * values. Scope, filter, and extraction
+ * gate are listMetadata's, so with a filter `eligibleDocuments` equals
+ * listMetadata's `filteredDocuments`. Key ranking, value windows, numeric
+ * ranges, and collection lists stay with listMetadata.
+ *
+ * One statement inside one deferred transaction builds the eligible documents
+ * once and the key's value rows once, and derives every count from those two
+ * materializations, so the whole result comes from one database snapshot.
+ */
+export function getMetadataCoverage(db: Database, options: MetadataCoverageOptions): MetadataCoverageResult {
+  const key = readKey(options.key);
+  const collectionNames = options.collection === undefined ? undefined : [options.collection].flat();
+  const eligible = buildEligibleCte(collectionNames, options.filter, true);
+  // The key is the one binding beyond the scope and filter.
+  const bindings = eligible.withParams.length + 1;
+  if (bindings > METADATA_SQL_BINDING_BUDGET) throw new MetadataBindingBudgetError(bindings, METADATA_SQL_BINDING_BUDGET, "filter and key");
+  return db.transaction(() => readMetadataCoverage(db, eligible, key))();
+}
+
+type CoverageRow = { eligible_documents: number; covered_documents: number; types: string };
+type TypeCoverageRow = { value_type: MetadataValueType; documents: number; distinct_values: number; multi_valued: number };
+
+/**
+ * Each type counts distinct values in its own column, so a string and a number
+ * stay apart even when they print alike. At most three type rows exist, so they
+ * travel as one JSON array and sort in JavaScript with discovery's comparator.
+ */
+function readMetadataCoverage(db: Database, eligible: Region, key: string): MetadataCoverageResult {
+  const row = db.prepare(`
+    ${eligible.withSql},
+    key_rows AS MATERIALIZED (
+      SELECT mv.document_id, mv.ordinal, mv.value_type, mv.text_value, mv.number_value, mv.boolean_value
+      FROM eligible e
+      CROSS JOIN document_metadata_values mv ON mv.document_id = e.document_id
+      WHERE mv.key = ?
+    ),
+    type_coverages AS (
+      SELECT value_type,
+        COUNT(DISTINCT document_id) AS documents,
+        COUNT(DISTINCT CASE value_type
+          WHEN 'string' THEN text_value
+          WHEN 'number' THEN number_value
+          WHEN 'boolean' THEN boolean_value
+        END) AS distinct_values,
+        MAX(ordinal) > 0 AS multi_valued
+      FROM key_rows
+      GROUP BY value_type
+    )
+    SELECT
+      (SELECT COUNT(*) FROM eligible) AS eligible_documents,
+      (SELECT COUNT(DISTINCT document_id) FROM key_rows) AS covered_documents,
+      (SELECT json_group_array(json_object(
+        'value_type', value_type,
+        'documents', documents,
+        'distinct_values', distinct_values,
+        'multi_valued', multi_valued
+      )) FROM type_coverages) AS types
+  `).get(...eligible.withParams, key) as CoverageRow;
+
+  const types = (JSON.parse(row.types) as TypeCoverageRow[]).map((summary): MetadataTypeCoverage => ({
+    type: summary.value_type,
+    documents: summary.documents,
+    distinctValues: summary.distinct_values,
+    multiValued: summary.multi_valued === 1,
+  }));
+  types.sort(compareTypeSummaries);
+  return { key, eligibleDocuments: row.eligible_documents, coveredDocuments: row.covered_documents, types };
+}
+
+/**
  * Every collection's key names, coverage, and types, in coverage order,
  * windowed to the first `keyLimit` keys per collection. One GROUP BY, no
  * values: what `collection list`, `status`, and the MCP status tool print so
@@ -557,7 +772,7 @@ function queryMetadataOverviews(db: Database, eligible: Region, keyLimit: number
   return overviews;
 }
 
-function compareTypeSummaries(a: MetadataKeyTypeSummary, b: MetadataKeyTypeSummary): number {
+function compareTypeSummaries(a: Pick<MetadataKeyTypeSummary, "type" | "documents">, b: Pick<MetadataKeyTypeSummary, "type" | "documents">): number {
   return b.documents - a.documents || compareBinary(a.type, b.type);
 }
 
@@ -633,6 +848,18 @@ function readSort(value: unknown): "count" | "value" {
   throw new MetadataOptionError("sort", "'count' or 'value'", value);
 }
 
+// The filter parser checks the key as a condition's `field`, so coverage
+// accepts exactly the keys a filter can name.
+function readKey(value: unknown): string {
+  try {
+    parseMetadataFilter({ field: value, operator: "exists", value: true });
+    return value as string;
+  } catch (error) {
+    if (!(error instanceof MetadataFilterError)) throw error;
+    throw new MetadataOptionError("key", `a non-empty string of at most ${METADATA_FILTER_LIMITS.maxKeyBytes} UTF-8 bytes`, value);
+  }
+}
+
 function formatReceived(value: unknown): string {
   if (typeof value === "string") return JSON.stringify(value);
   if (typeof value === "number" || typeof value === "boolean" || value === null) return String(value);
@@ -650,11 +877,13 @@ function formatReceived(value: unknown): string {
  * compiled for the corpus: every statement that reads this CTE joins it to
  * metadata rows, and a correlated predicate would be re-run for each of
  * them, where a document set is built once per statement and probed.
+ * `materialized` makes a statement that reads the CTE more than once build
+ * the document set once.
  */
-function buildEligibleCte(collectionNames: string[] | undefined, filter: MetadataFilter | undefined): Region {
+function buildEligibleCte(collectionNames: string[] | undefined, filter: MetadataFilter | undefined, materialized = false): Region {
   const withParams: SQLiteValue[] = [];
   let withSql = `
-    WITH eligible AS (
+    WITH eligible AS ${materialized ? "MATERIALIZED " : ""}(
       SELECT d.id AS document_id, d.collection
       FROM documents d
       JOIN document_metadata dm ON dm.document_id = d.id
